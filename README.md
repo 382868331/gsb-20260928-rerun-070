@@ -18,6 +18,20 @@ executor contract.
    never shifts another request's output.
 5. Futures finish as `FINISHED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`.
 
+## Priority and fairness
+
+Each `Request` carries a `priority` (`Priority.LOW`, `NORMAL`, or `HIGH`).
+The worker always forms the next batch around the queued request with the
+highest effective priority, and only groups requests whose dtype and shape
+match that anchor. To keep a continuous stream of high-priority traffic from
+starving normal requests, every `aging_interval` seconds of queue wait raises
+a request's effective priority by one level; ties are broken by arrival
+order, so any queued request is served within a bounded time.
+
+`stop()` fails every still-queued request with `EngineStoppedError` and, if
+the worker cannot finish an in-flight batch before the join timeout, fails
+those requests too; no future is left waiting forever.
+
 ## Built-in models
 
 `LinearModel` and `AddConstantModel` are deterministic and implemented in pure

@@ -18,7 +18,7 @@ from .errors import (
 )
 from .executor import DynamicBatchingExecutor, ExecutorConfig
 from .models import AddConstantModel, LinearModel, Model
-from .types import PredictionFuture, Request, RequestState
+from .types import PredictionFuture, Priority, Request, RequestState
 
 __all__ = [
     "AddConstantModel",
@@ -30,6 +30,7 @@ __all__ = [
     "Model",
     "ModelReloadError",
     "PredictionFuture",
+    "Priority",
     "QueueFullError",
     "Request",
     "RequestCancelledError",

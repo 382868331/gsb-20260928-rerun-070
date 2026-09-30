@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Any, Optional
 
 
@@ -14,6 +14,14 @@ class RequestState(Enum):
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
     FAILED = "failed"
+
+
+class Priority(IntEnum):
+    """Scheduling priority; larger values are served first."""
+
+    LOW = 0
+    NORMAL = 1
+    HIGH = 2
 
 
 @dataclass(frozen=True)
@@ -27,6 +35,7 @@ class Request:
     data: tuple[Any, ...]
     shape: tuple[int, ...]
     dtype: type = float
+    priority: Priority = Priority.NORMAL
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property

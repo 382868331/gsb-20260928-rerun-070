@@ -24,6 +24,10 @@ class ExecutorConfig:
     max_batch_size: int = 32
     max_wait_time: float = 0.02
     default_timeout: Optional[float] = 5.0
+    # Seconds of queue wait that raise a request's effective priority by one
+    # level. Lower-priority requests therefore cannot starve under a
+    # continuous stream of higher-priority traffic.
+    aging_interval: float = 0.5
 
 
 @dataclass
@@ -31,6 +35,7 @@ class _Entry:
     request: Request
     future: PredictionFuture
     deadline: Optional[float]
+    enqueued_at: float = 0.0
 
 
 class DynamicBatchingExecutor:
@@ -89,7 +94,12 @@ class DynamicBatchingExecutor:
                 raise QueueFullError(
                     f"inference queue is full: {len(self._queue)}/{self._config.max_queue_size}"
                 )
-            entry = _Entry(request=request, future=future, deadline=deadline)
+            entry = _Entry(
+                request=request,
+                future=future,
+                deadline=deadline,
+                enqueued_at=self._clock(),
+            )
             self._queue.append(entry)
             self._entries[request.request_id] = entry
             self._condition.notify_all()
@@ -159,6 +169,18 @@ class DynamicBatchingExecutor:
                 EngineStoppedError("executor stopped before request ran"),
                 RequestState.FAILED,
             )
+        # Any request still unresolved after the worker exits (for example a
+        # batch stuck in a slow model past the join timeout) must reach a
+        # terminal state instead of waiting forever.
+        with self._condition:
+            leftovers = list(self._entries.values())
+            self._entries.clear()
+            self._queue.clear()
+        for entry in leftovers:
+            entry.future.set_exception(
+                EngineStoppedError("executor stopped before request completed"),
+                RequestState.FAILED,
+            )
 
     def __enter__(self) -> "DynamicBatchingExecutor":
         return self.start()
@@ -178,7 +200,7 @@ class DynamicBatchingExecutor:
                     self._expire_requests_locked()
                     self._apply_reload_locked()
                     if self._queue:
-                        anchor = self._queue[0]
+                        anchor = self._select_anchor_locked()
                         compatible = [
                             entry
                             for entry in self._queue
@@ -213,18 +235,37 @@ class DynamicBatchingExecutor:
                 self._apply_reload_locked()
 
     def _take_batch_locked(self, key: tuple[type, tuple[int, ...]]) -> list[_Entry]:
-        selected: list[_Entry] = []
-        remaining: Deque[_Entry] = deque()
-        for entry in self._queue:
-            if (
-                len(selected) < self._config.max_batch_size
-                and entry.request.batching_key == key
-            ):
-                selected.append(entry)
-            else:
-                remaining.append(entry)
-        self._queue = remaining
+        compatible = [
+            entry
+            for entry in self._queue
+            if entry.request.batching_key == key
+        ]
+        compatible.sort(key=self._scheduling_key_locked)
+        selected = compatible[: self._config.max_batch_size]
+        selected_ids = {id(entry) for entry in selected}
+        self._queue = deque(
+            entry for entry in self._queue if id(entry) not in selected_ids
+        )
         return selected
+
+    def _select_anchor_locked(self) -> _Entry:
+        return min(self._queue, key=self._scheduling_key_locked)
+
+    def _scheduling_key_locked(self, entry: _Entry) -> tuple[int, float]:
+        # Higher effective priority first; ties broken by arrival order so
+        # same-priority requests stay FIFO and aged requests eventually win.
+        return (-self._effective_priority_locked(entry), entry.enqueued_at)
+
+    def _effective_priority_locked(self, entry: _Entry) -> int:
+        from .types import Priority
+
+        priority = int(entry.request.priority)
+        interval = self._config.aging_interval
+        if interval is None or interval <= 0:
+            return priority
+        age = self._clock() - entry.enqueued_at
+        boost = int(age // interval)
+        return min(int(Priority.HIGH), priority + boost)
 
     def _execute(self, batch: Sequence[_Entry], model: Model) -> None:
         active: list[_Entry] = []

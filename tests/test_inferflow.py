@@ -7,10 +7,12 @@ import unittest
 from inferflow import (
     AddConstantModel,
     DynamicBatchingExecutor,
+    EngineStoppedError,
     ExecutorConfig,
     IncompatibleInputError,
     LinearModel,
     ModelReloadError,
+    Priority,
     QueueFullError,
     Request,
     RequestCancelledError,
@@ -180,6 +182,108 @@ class ExecutorTests(unittest.TestCase):
             new.release.set()
             self.assertEqual(first.result(1), ("old", 0))
             self.assertEqual(second.result(1), ("new", 0))
+
+    def test_high_priority_served_before_queued_normal(self):
+        model = GateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            blocker = executor.submit(linear_sample((0, 0, 0, 0)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            normal = executor.submit(linear_sample((1, 1, 1, 1)), timeout=None)
+            high = executor.submit(
+                Request(data=(2, 2, 2, 2), shape=(4,), priority=Priority.HIGH),
+                timeout=None,
+            )
+            time.sleep(0.03)
+            model.release.set()
+            blocker.result(1)
+            high.result(1)
+            normal.result(1)
+        served = [batch[0] for batch in model.batches]
+        self.assertEqual(served, [(0, 0, 0, 0), (2, 2, 2, 2), (1, 1, 1, 1)])
+
+    def test_aging_prevents_starvation_under_continuous_high_priority(self):
+        model = GateModel()
+        config = ExecutorConfig(
+            max_batch_size=1, max_wait_time=0.001, aging_interval=0.05
+        )
+        with DynamicBatchingExecutor(model, config) as executor:
+            blocker = executor.submit(linear_sample((0, 0, 0, 0)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            normal = executor.submit(linear_sample((1, 1, 1, 1)), timeout=None)
+            time.sleep(0.12)  # normal ages up to effective HIGH
+            highs = [
+                executor.submit(
+                    Request(
+                        data=(float(i),) * 4, shape=(4,), priority=Priority.HIGH
+                    ),
+                    timeout=None,
+                )
+                for i in range(2, 5)
+            ]
+            time.sleep(0.03)
+            model.release.set()
+            blocker.result(1)
+            normal.result(1)
+            for future in highs:
+                future.result(1)
+        served = [batch[0] for batch in model.batches]
+        self.assertEqual(served[0], (0, 0, 0, 0))
+        # Aged normal request wins the tie against newer HIGH requests.
+        self.assertEqual(served[1], (1, 1, 1, 1))
+        self.assertEqual(normal.state, RequestState.FINISHED)
+
+    def test_stop_fails_queued_and_in_flight_requests(self):
+        model = GateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        executor = DynamicBatchingExecutor(model, config).start()
+        running = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+        self.assertTrue(model.entered.wait(1))
+        queued = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+        time.sleep(0.02)
+        executor.stop(timeout=0.05)
+        for future in (running, queued):
+            self.assertTrue(future.done())
+            self.assertEqual(future.state, RequestState.FAILED)
+            with self.assertRaises(EngineStoppedError):
+                future.result(0.1)
+        model.release.set()
+
+    def test_queue_full_rejection_reports_capacity(self):
+        model = GateModel()
+        config = ExecutorConfig(
+            max_queue_size=1, max_batch_size=1, max_wait_time=0.001
+        )
+        with DynamicBatchingExecutor(model, config) as executor:
+            executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            with self.assertRaises(QueueFullError) as ctx:
+                executor.submit(linear_sample((9, 10, 11, 12)), timeout=None)
+            self.assertIn("1/1", str(ctx.exception))
+            model.release.set()
+
+    def test_reload_failure_preserves_batches_and_terminal_states(self):
+        old = GateModel(version="old")
+        config = ExecutorConfig(max_batch_size=2, max_wait_time=0.01)
+        with DynamicBatchingExecutor(old, config) as executor:
+            def fail_loader():
+                raise RuntimeError("corrupt weights")
+
+            with self.assertRaises(ModelReloadError) as ctx:
+                executor.reload_model(fail_loader)
+            self.assertIn("corrupt weights", str(ctx.exception))
+            self.assertIs(executor.model, old)
+
+            first = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            second = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            self.assertTrue(old.entered.wait(1))
+            old.release.set()
+            self.assertEqual(first.result(1), ("old", 0))
+            self.assertEqual(second.result(1), ("old", 1))
+            self.assertEqual(first.state, RequestState.FINISHED)
+            self.assertEqual(second.state, RequestState.FINISHED)
+        self.assertEqual(old.batches, [[(1, 2, 3, 4), (5, 6, 7, 8)]])
 
 
 if __name__ == "__main__":
