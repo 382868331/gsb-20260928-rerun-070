@@ -27,6 +27,7 @@ class Request:
     data: tuple[Any, ...]
     shape: tuple[int, ...]
     dtype: type = float
+    priority: int = 0
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
@@ -39,6 +40,8 @@ class PredictionFuture:
 
     def __init__(self, request_id: str):
         self.request_id = request_id
+        self.batch_id: Optional[str] = None
+        self.model_version: Optional[str] = None
         self._event = threading.Event()
         self._lock = threading.Lock()
         self._state = RequestState.QUEUED

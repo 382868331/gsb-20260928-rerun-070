@@ -24,6 +24,10 @@ class ExecutorConfig:
     max_batch_size: int = 32
     max_wait_time: float = 0.02
     default_timeout: Optional[float] = 5.0
+    # Seconds of queueing that raise effective priority by one; None disables
+    # aging. Aging guarantees normal requests are not starved by a sustained
+    # stream of higher-priority arrivals.
+    priority_aging: Optional[float] = 0.05
 
 
 @dataclass
@@ -31,6 +35,8 @@ class _Entry:
     request: Request
     future: PredictionFuture
     deadline: Optional[float]
+    enqueued_at: float = 0.0
+    seq: int = 0
 
 
 class DynamicBatchingExecutor:
@@ -54,6 +60,8 @@ class DynamicBatchingExecutor:
         self._batch_in_flight = 0
         self._running_entries: list[_Entry] = []
         self._pending_reload: tuple[Optional[Model], Optional[float]] = (None, None)
+        self._enqueue_seq = 0
+        self._batch_seq = 0
 
     @property
     def model(self) -> Model:
@@ -90,6 +98,9 @@ class DynamicBatchingExecutor:
                     f"inference queue is full: {len(self._queue)}/{self._config.max_queue_size}"
                 )
             entry = _Entry(request=request, future=future, deadline=deadline)
+            entry.enqueued_at = self._clock()
+            entry.seq = self._enqueue_seq
+            self._enqueue_seq += 1
             self._queue.append(entry)
             self._entries[request.request_id] = entry
             self._condition.notify_all()
@@ -150,15 +161,12 @@ class DynamicBatchingExecutor:
             self._running = False
             self._stopped = True
             worker = self._worker
-            queued = list(self._queue) if reject_queued else []
             self._condition.notify_all()
         if worker is not None:
             worker.join(timeout)
-        for entry in queued:
-            entry.future.set_exception(
-                EngineStoppedError("executor stopped before request ran"),
-                RequestState.FAILED,
-            )
+        # Whatever is still unfinished after the worker exits must not wait
+        # forever: fail it with an explicit shutdown reason.
+        self._fail_remaining(EngineStoppedError("executor stopped before request ran"))
 
     def __enter__(self) -> "DynamicBatchingExecutor":
         return self.start()
@@ -174,11 +182,15 @@ class DynamicBatchingExecutor:
                 batch_deadline: Optional[float] = None
                 while True:
                     if not self._running:
+                        self._drain_queue_locked(
+                            EngineStoppedError("executor stopped while requests were queued")
+                        )
                         return
                     self._expire_requests_locked()
                     self._apply_reload_locked()
                     if self._queue:
-                        anchor = self._queue[0]
+                        now = self._clock()
+                        anchor = self._select_anchor_locked(now)
                         compatible = [
                             entry
                             for entry in self._queue
@@ -191,7 +203,7 @@ class DynamicBatchingExecutor:
                         )
                         if ready or waited_enough:
                             model = self._model
-                            batch = self._take_batch_locked(anchor.request.batching_key)
+                            batch = self._take_batch_locked(anchor.request.batching_key, now)
                             self._batch_in_flight += 1
                             self._running_entries.extend(batch)
                             break
@@ -212,19 +224,52 @@ class DynamicBatchingExecutor:
                     self._entries.pop(entry.request.request_id, None)
                 self._apply_reload_locked()
 
-    def _take_batch_locked(self, key: tuple[type, tuple[int, ...]]) -> list[_Entry]:
-        selected: list[_Entry] = []
-        remaining: Deque[_Entry] = deque()
-        for entry in self._queue:
-            if (
-                len(selected) < self._config.max_batch_size
-                and entry.request.batching_key == key
-            ):
-                selected.append(entry)
-            else:
-                remaining.append(entry)
-        self._queue = remaining
+    def _effective_priority(self, entry: _Entry, now: float) -> float:
+        aging = self._config.priority_aging
+        if not aging or aging <= 0:
+            return float(entry.request.priority)
+        aged = max(0.0, now - entry.enqueued_at) / aging
+        return entry.request.priority + aged
+
+    def _select_anchor_locked(self, now: float) -> _Entry:
+        """Highest effective priority wins; ties break by arrival order."""
+        return min(
+            self._queue,
+            key=lambda entry: (-self._effective_priority(entry, now), entry.seq),
+        )
+
+    def _take_batch_locked(
+        self, key: tuple[type, tuple[int, ...]], now: float
+    ) -> list[_Entry]:
+        compatible = [
+            entry for entry in self._queue if entry.request.batching_key == key
+        ]
+        compatible.sort(key=lambda entry: (-self._effective_priority(entry, now), entry.seq))
+        selected = compatible[: self._config.max_batch_size]
+        chosen = set(id(entry) for entry in selected)
+        self._queue = deque(
+            entry for entry in self._queue if id(entry) not in chosen
+        )
+        self._batch_seq += 1
+        batch_id = f"batch-{self._batch_seq}"
+        for entry in selected:
+            entry.future.batch_id = batch_id
+            entry.future.model_version = self._model.version
         return selected
+
+    def _drain_queue_locked(self, exc: BaseException) -> None:
+        drained = list(self._queue)
+        self._queue.clear()
+        for entry in drained:
+            self._entries.pop(entry.request.request_id, None)
+            entry.future.set_exception(exc, RequestState.FAILED)
+
+    def _fail_remaining(self, exc: BaseException) -> None:
+        with self._condition:
+            self._drain_queue_locked(exc)
+            running = list(self._running_entries)
+        for entry in running:
+            entry.future.set_exception(exc, RequestState.FAILED)
 
     def _execute(self, batch: Sequence[_Entry], model: Model) -> None:
         active: list[_Entry] = []

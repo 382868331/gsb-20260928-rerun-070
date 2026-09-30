@@ -13,10 +13,19 @@ executor contract.
    `PredictionFuture`.
 3. The worker groups queued requests only when dtype and shape match, waits a
    short window for more compatible traffic, then enforces `max_batch_size`.
+   Requests carry a `priority` (higher runs earlier); queued requests gain
+   effective priority as they age (`priority_aging`), so a sustained stream
+   of high-priority arrivals cannot starve normal traffic. Each formed batch
+   gets a `batch_id` exposed on the future, along with the `model_version`
+   that will serve it.
 4. The selected model validates each request and receives a list of samples.
    Output list position is returned to the corresponding request; cancellation
    never shifts another request's output.
 5. Futures finish as `FINISHED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`.
+   Rejections carry explicit reasons (`QueueFullError` when the bounded queue
+   is saturated, `EngineStoppedError` once shutdown begins). `stop()` lets an
+   in-flight batch finish, then fails every still-queued request with
+   `EngineStoppedError` so no request waits forever.
 
 ## Built-in models
 
