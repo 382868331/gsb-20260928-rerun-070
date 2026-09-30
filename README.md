@@ -18,6 +18,20 @@ executor contract.
    never shifts another request's output.
 5. Futures finish as `FINISHED`, `FAILED`, `CANCELLED`, or `TIMED_OUT`.
 
+## Execution attribution
+
+Every `PredictionFuture` exposes `attribution`, a `BatchAttribution` bound
+exactly once when the request enters a batch: `batch_id`, `model_name`,
+`model_version`, `batch_size`, and the request's `batch_index`. Requests that
+never reached a batch (cancelled, expired, or drained while queued) keep
+`attribution is None`. `history` returns the ordered state transitions, so
+queueing, batch entry, cancellation, and completion are each traceable
+without instrumenting the model. During `reload_model`, batches already in
+flight keep the old model's attribution while later batches bind the new
+version; a failed reload changes nothing. Attribution, terminal state, and
+history are stable under repeated reads, including when cancellation races
+completion, a batch partially fails, or the executor stops.
+
 ## Priority and fairness
 
 Each `Request` carries a `priority` (`Priority.LOW`, `NORMAL`, or `HIGH`).

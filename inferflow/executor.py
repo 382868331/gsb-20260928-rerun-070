@@ -15,7 +15,7 @@ from .errors import (
     RequestTimeoutError,
 )
 from .models import Model
-from .types import PredictionFuture, Request, RequestState
+from .types import BatchAttribution, PredictionFuture, Request, RequestState
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,7 @@ class DynamicBatchingExecutor:
         self._batch_in_flight = 0
         self._running_entries: list[_Entry] = []
         self._pending_reload: tuple[Optional[Model], Optional[float]] = (None, None)
+        self._batch_sequence = 0
 
     @property
     def model(self) -> Model:
@@ -269,9 +270,23 @@ class DynamicBatchingExecutor:
 
     def _execute(self, batch: Sequence[_Entry], model: Model) -> None:
         active: list[_Entry] = []
-        for entry in batch:
+        with self._condition:
+            self._batch_sequence += 1
+            sequence = self._batch_sequence
+        batch_id = f"batch-{sequence}"
+        model_name = getattr(model, "name", type(model).__name__)
+        for batch_index, entry in enumerate(batch):
             if entry.future.state == RequestState.CANCELLED:
                 continue
+            entry.future.set_attribution(
+                BatchAttribution(
+                    batch_id=batch_id,
+                    model_name=model_name,
+                    model_version=model.version,
+                    batch_size=len(batch),
+                    batch_index=batch_index,
+                )
+            )
             try:
                 model.check(entry.request.shape, entry.request.dtype)
             except Exception as exc:

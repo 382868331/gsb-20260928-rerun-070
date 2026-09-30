@@ -25,6 +25,22 @@ class Priority(IntEnum):
 
 
 @dataclass(frozen=True)
+class BatchAttribution:
+    """Execution ownership of a request once it enters a batch.
+
+    Immutable and assigned exactly once, so repeated reads never observe
+    contradictory batch identities or model versions. batch_index is the
+    request's position within the formed batch.
+    """
+
+    batch_id: str
+    model_name: str
+    model_version: str
+    batch_size: int
+    batch_index: int
+
+
+@dataclass(frozen=True)
 class Request:
     """A single inference invocation.
 
@@ -53,11 +69,33 @@ class PredictionFuture:
         self._state = RequestState.QUEUED
         self._result: Any = None
         self._exception: Optional[BaseException] = None
+        self._attribution: Optional[BatchAttribution] = None
+        self._history: list[RequestState] = [RequestState.QUEUED]
 
     @property
     def state(self) -> RequestState:
         with self._lock:
             return self._state
+
+    @property
+    def attribution(self) -> Optional[BatchAttribution]:
+        """Batch/model ownership; None while the request never entered a batch."""
+        with self._lock:
+            return self._attribution
+
+    @property
+    def history(self) -> tuple[RequestState, ...]:
+        """Ordered state transitions, e.g. QUEUED -> RUNNING -> FINISHED."""
+        with self._lock:
+            return tuple(self._history)
+
+    def set_attribution(self, attribution: BatchAttribution) -> bool:
+        """Bind execution ownership once; later attempts are ignored."""
+        with self._lock:
+            if self._attribution is not None:
+                return False
+            self._attribution = attribution
+            return True
 
     def done(self) -> bool:
         return self._event.is_set()
@@ -88,6 +126,7 @@ class PredictionFuture:
         with self._lock:
             if self._state == RequestState.QUEUED:
                 self._state = RequestState.RUNNING
+                self._history.append(RequestState.RUNNING)
 
     def _complete(
         self,
@@ -101,6 +140,7 @@ class PredictionFuture:
             self._state = state
             self._result = result
             self._exception = exception
+            self._history.append(state)
             self._event.set()
             return True
 

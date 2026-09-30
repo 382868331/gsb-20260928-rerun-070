@@ -286,5 +286,150 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(old.batches, [[(1, 2, 3, 4), (5, 6, 7, 8)]])
 
 
+class AttributionTests(unittest.TestCase):
+    def test_finished_requests_share_batch_identity_and_version(self):
+        model = RecordingLinearModel()
+        config = ExecutorConfig(max_batch_size=4, max_wait_time=0.05)
+        samples = [(0.1, 0.2, 0.3, 0.4), (1.0, 2.0, 3.0, 4.0)]
+        with DynamicBatchingExecutor(model, config) as executor:
+            futures = [executor.submit(linear_sample(sample)) for sample in samples]
+            for future in futures:
+                future.result(1)
+        attributions = [future.attribution for future in futures]
+        self.assertTrue(all(item is not None for item in attributions))
+        self.assertEqual(
+            {item.batch_id for item in attributions}, {attributions[0].batch_id}
+        )
+        for index, attribution in enumerate(attributions):
+            self.assertEqual(attribution.model_name, model.name)
+            self.assertEqual(attribution.model_version, model.version)
+            self.assertEqual(attribution.batch_size, 2)
+            self.assertEqual(attribution.batch_index, index)
+        for future in futures:
+            self.assertEqual(
+                future.history,
+                (RequestState.QUEUED, RequestState.RUNNING, RequestState.FINISHED),
+            )
+
+    def test_cancelled_queued_request_has_no_attribution(self):
+        model = GateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            blocker = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            queued = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            time.sleep(0.03)
+            self.assertTrue(executor.cancel(queued.request_id))
+            model.release.set()
+            blocker.result(1)
+        self.assertIsNone(queued.attribution)
+        self.assertEqual(queued.history, (RequestState.QUEUED, RequestState.CANCELLED))
+        self.assertIsNotNone(blocker.attribution)
+
+    def test_reload_boundary_splits_attribution_between_versions(self):
+        old = GateModel(version="old")
+        new = GateModel(version="new")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(old, config) as executor:
+            first = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(old.entered.wait(1))
+
+            reloaded = threading.Event()
+
+            def reload():
+                executor.reload_model(new, timeout=2)
+                reloaded.set()
+
+            threading.Thread(target=reload, daemon=True).start()
+            time.sleep(0.05)
+            second = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            old.release.set()
+            self.assertTrue(reloaded.wait(1))
+            self.assertTrue(new.entered.wait(1))
+            new.release.set()
+            first.result(1)
+            second.result(1)
+        self.assertEqual(first.attribution.model_version, "old")
+        self.assertEqual(second.attribution.model_version, "new")
+        self.assertNotEqual(first.attribution.batch_id, second.attribution.batch_id)
+
+    def test_failed_reload_keeps_in_flight_attribution(self):
+        old = GateModel(version="old")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(old, config) as executor:
+            first = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(old.entered.wait(1))
+
+            def fail_loader():
+                raise RuntimeError("corrupt weights")
+
+            with self.assertRaises(ModelReloadError):
+                executor.reload_model(fail_loader)
+            old.release.set()
+            first.result(1)
+            second = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            second.result(1)
+        self.assertEqual(first.attribution.model_version, "old")
+        self.assertEqual(second.attribution.model_version, "old")
+
+    def test_partial_batch_failure_keeps_shared_batch_identity(self):
+        model = GateModel()
+        config = ExecutorConfig(max_batch_size=2, max_wait_time=0.01)
+        with DynamicBatchingExecutor(model, config) as executor:
+            timed_out = executor.submit(linear_sample((1, 2, 3, 4)), timeout=0.05)
+            finished = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            time.sleep(0.1)
+            model.release.set()
+            with self.assertRaises(RequestTimeoutError):
+                timed_out.result(1)
+            finished.result(1)
+        self.assertEqual(timed_out.state, RequestState.TIMED_OUT)
+        self.assertEqual(finished.state, RequestState.FINISHED)
+        self.assertIsNotNone(timed_out.attribution)
+        self.assertIsNotNone(finished.attribution)
+        self.assertEqual(timed_out.attribution.batch_id, finished.attribution.batch_id)
+        self.assertEqual(timed_out.attribution.batch_index, 0)
+        self.assertEqual(finished.attribution.batch_index, 1)
+
+    def test_stop_leaves_stable_records(self):
+        model = GateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        executor = DynamicBatchingExecutor(model, config).start()
+        running = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+        self.assertTrue(model.entered.wait(1))
+        queued = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+        time.sleep(0.02)
+        executor.stop(timeout=0.05)
+        model.release.set()
+        self.assertEqual(running.state, RequestState.FAILED)
+        self.assertIsNotNone(running.attribution)
+        self.assertEqual(running.attribution.model_version, model.version)
+        self.assertEqual(queued.state, RequestState.FAILED)
+        self.assertIsNone(queued.attribution)
+        for future in (running, queued):
+            self.assertEqual(future.state, future.state)
+            self.assertEqual(future.attribution, future.attribution)
+            self.assertEqual(future.history, future.history)
+
+    def test_repeated_reads_never_contradict(self):
+        model = GateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            future = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            model.release.set()
+            value = future.result(1)
+            first_read = (future.state, future.attribution, future.result(1))
+            second_read = (future.state, future.attribution, future.result(1))
+        self.assertEqual(first_read, second_read)
+        self.assertFalse(future.cancel())
+        self.assertEqual(future.state, RequestState.FINISHED)
+        self.assertEqual(
+            future.history,
+            (RequestState.QUEUED, RequestState.RUNNING, RequestState.FINISHED),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
