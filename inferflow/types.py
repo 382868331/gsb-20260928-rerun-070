@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from typing import Any, Optional
 
@@ -14,6 +14,26 @@ class RequestState(Enum):
     CANCELLED = "cancelled"
     TIMED_OUT = "timed_out"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ExecutionInfo:
+    """Immutable snapshot of a request's execution attribution.
+
+    ``batch_id``/``model_name``/``model_version`` are bound exactly once, when
+    the worker admits the request into a batch. Requests still queued are not
+    bound; terminal snapshots preserve whatever attribution existed.
+    """
+
+    state: RequestState
+    batch_id: Optional[int] = None
+    model_name: Optional[str] = None
+    model_version: Optional[str] = None
+    batch_index: Optional[int] = None
+
+    @property
+    def bound(self) -> bool:
+        return self.batch_id is not None
 
 
 class Priority(IntEnum):
@@ -50,14 +70,27 @@ class PredictionFuture:
         self.request_id = request_id
         self._event = threading.Event()
         self._lock = threading.Lock()
-        self._state = RequestState.QUEUED
+        self._info = ExecutionInfo(state=RequestState.QUEUED)
+        self._history: list[ExecutionInfo] = [self._info]
         self._result: Any = None
         self._exception: Optional[BaseException] = None
 
     @property
     def state(self) -> RequestState:
         with self._lock:
-            return self._state
+            return self._info.state
+
+    @property
+    def info(self) -> ExecutionInfo:
+        """Stable attribution snapshot; never changes after a terminal state."""
+        with self._lock:
+            return self._info
+
+    @property
+    def history(self) -> tuple[ExecutionInfo, ...]:
+        """Queued -> bound -> terminal attribution snapshots, in order."""
+        with self._lock:
+            return tuple(self._history)
 
     def done(self) -> bool:
         return self._event.is_set()
@@ -84,10 +117,31 @@ class PredictionFuture:
             exception=exc or RequestCancelledError("request cancelled"),
         )
 
-    def mark_running(self) -> None:
+    def bind_batch(
+        self,
+        batch_id: int,
+        model_name: str,
+        model_version: str,
+        batch_index: int,
+    ) -> bool:
+        """Bind the request to the batch that will execute it.
+
+        Happens atomically with dequeue under the executor lock, so a request
+        is either cancelled while still queued (unbound) or admitted exactly
+        once (bound).
+        """
         with self._lock:
-            if self._state == RequestState.QUEUED:
-                self._state = RequestState.RUNNING
+            if self._event.is_set() or self._info.state != RequestState.QUEUED:
+                return False
+            self._info = ExecutionInfo(
+                state=RequestState.RUNNING,
+                batch_id=batch_id,
+                model_name=model_name,
+                model_version=model_version,
+                batch_index=batch_index,
+            )
+            self._history.append(self._info)
+            return True
 
     def _complete(
         self,
@@ -98,11 +152,15 @@ class PredictionFuture:
         with self._lock:
             if self._event.is_set():
                 return False
-            self._state = state
+            self._info = replace(self._info, state=state)
+            self._history.append(self._info)
             self._result = result
             self._exception = exception
             self._event.set()
             return True
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
-        return f"PredictionFuture(request_id={self.request_id!r}, state={self._state.value})"
+        return (
+            f"PredictionFuture(request_id={self.request_id!r}, "
+            f"state={self._info.state.value})"
+        )

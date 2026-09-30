@@ -9,6 +9,7 @@ from inferflow import (
     DynamicBatchingExecutor,
     EngineStoppedError,
     ExecutorConfig,
+    ExecutionInfo,
     IncompatibleInputError,
     LinearModel,
     ModelReloadError,
@@ -58,7 +59,189 @@ class RecordingLinearModel(LinearModel):
         return super().predict(samples)
 
 
+class PartialFailModel(GateModel):
+    """Fails validation for every second request while accepting the rest."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._checks = 0
+
+    def check(self, request_shape, dtype):
+        super().check(request_shape, dtype)
+        self._checks += 1
+        if self._checks % 2 == 0:
+            raise IncompatibleInputError("rejected sample")
+
+
 class ExecutorTests(unittest.TestCase):
+    def test_finished_future_reports_batch_and_model_attribution(self):
+        model = LinearModel(version="linear-v42")
+        config = ExecutorConfig(max_batch_size=4, max_wait_time=0.05)
+        with DynamicBatchingExecutor(model, config) as executor:
+            first = executor.submit(linear_sample((1.0, 2.0, 3.0, 4.0)))
+            second = executor.submit(linear_sample((5.0, 6.0, 7.0, 8.0)))
+            first.result(1)
+            second.result(1)
+
+        self.assertEqual(first.info.state, RequestState.FINISHED)
+        self.assertEqual(second.info.state, RequestState.FINISHED)
+        self.assertEqual(first.info.batch_id, 0)
+        self.assertEqual(second.info.batch_id, 0)
+        self.assertEqual(first.info.model_version, "linear-v42")
+        self.assertEqual(second.info.model_version, "linear-v42")
+        self.assertEqual(first.info.model_name, model.name)
+        self.assertEqual(first.info.batch_index, 0)
+        self.assertEqual(second.info.batch_index, 1)
+        self.assertTrue(first.info.bound)
+
+    def test_queued_info_is_unbound_and_cancel_is_traceable_without_batch(self):
+        model = GateModel(version="old")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            running = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            queued = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            time.sleep(0.02)
+
+            pending = executor.info(queued.request_id)
+            self.assertEqual(pending.state, RequestState.QUEUED)
+            self.assertFalse(pending.bound)
+            self.assertIsNone(pending.batch_id)
+            self.assertIsNone(pending.model_version)
+
+            self.assertTrue(executor.cancel(queued.request_id))
+            cancelled_info = executor.info(queued.request_id)
+            self.assertEqual(cancelled_info.state, RequestState.CANCELLED)
+            self.assertIsNone(cancelled_info.batch_id)
+            self.assertIsNone(cancelled_info.model_version)
+            model.release.set()
+            running.result(1)
+
+    def test_terminal_attribution_is_stable_across_repeated_reads(self):
+        old = GateModel(version="old")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        executor = DynamicBatchingExecutor(old, config).start()
+        future = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+        self.assertTrue(old.entered.wait(1))
+        executor.stop(timeout=0.05)
+
+        self.assertTrue(future.done())
+        infos = [future.info for _ in range(5)]
+        self.assertTrue(all(info == infos[0] for info in infos))
+        self.assertEqual(infos[0].state, RequestState.FAILED)
+        self.assertEqual(infos[0].batch_id, 0)
+        self.assertEqual(infos[0].model_version, "old")
+        queried = executor.info(future.request_id)
+        self.assertEqual(queried, infos[0])
+        old.release.set()
+
+    def test_partial_batch_failure_keeps_shared_batch_identity(self):
+        model = PartialFailModel(version="partial")
+        config = ExecutorConfig(max_batch_size=2, max_wait_time=0.02)
+        with DynamicBatchingExecutor(model, config) as executor:
+            first = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            second = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            model.release.set()
+            first.result(1)
+            with self.assertRaises(IncompatibleInputError):
+                second.result(1)
+
+        self.assertEqual(first.info.state, RequestState.FINISHED)
+        self.assertEqual(second.info.state, RequestState.FAILED)
+        self.assertIsNotNone(first.info.batch_id)
+        self.assertEqual(first.info.batch_id, second.info.batch_id)
+        self.assertEqual(first.info.model_version, "partial")
+        self.assertEqual(second.info.model_version, "partial")
+        self.assertEqual(first.info.batch_index, 0)
+        self.assertEqual(second.info.batch_index, 1)
+
+    def test_reload_attributes_in_flight_batch_to_old_and_new_traffic_to_new(self):
+        old = GateModel(version="old")
+        new = GateModel(version="new")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(old, config) as executor:
+            first = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(old.entered.wait(1))
+
+            reloaded = threading.Event()
+
+            def reload():
+                executor.reload_model(new, timeout=2)
+                reloaded.set()
+
+            threading.Thread(target=reload, daemon=True).start()
+            time.sleep(0.05)
+            self.assertFalse(reloaded.is_set())
+            # The first request is already bound to the old model batch.
+            first_info = executor.info(first.request_id)
+            self.assertEqual(first_info.model_version, "old")
+            self.assertIsNotNone(first_info.batch_id)
+
+            second = executor.submit(linear_sample((5, 6, 7, 8)), timeout=None)
+            # Still queued when the old batch is in flight: unbound, so it is
+            # eligible for the replacement model.
+            pending = executor.info(second.request_id)
+            self.assertEqual(pending.state, RequestState.QUEUED)
+            self.assertIsNone(pending.model_version)
+
+            old.release.set()
+            self.assertTrue(reloaded.wait(1))
+            self.assertTrue(new.entered.wait(1))
+            new.release.set()
+            first.result(1)
+            second.result(1)
+
+        self.assertEqual(first.info.model_version, "old")
+        self.assertEqual(second.info.model_version, "new")
+        self.assertEqual(first.info.batch_id, 0)
+        self.assertEqual(second.info.batch_id, 1)
+
+    def test_failed_reload_does_not_change_in_flight_attribution(self):
+        old = GateModel(version="old")
+        failed_new = GateModel(version="would-be-new")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(old, config) as executor:
+            first = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(old.entered.wait(1))
+
+            reloaded = threading.Event()
+
+            def reload():
+                try:
+                    executor.reload_model(failed_new, timeout=0.05)
+                except ModelReloadError:
+                    reloaded.set()
+
+            threading.Thread(target=reload, daemon=True).start()
+            self.assertTrue(reloaded.wait(1))
+            self.assertIs(executor.model, old)
+            # Attribution captured by the executing batch is untouched.
+            self.assertEqual(
+                executor.info(first.request_id).model_version, "old"
+            )
+            old.release.set()
+            first.result(1)
+            self.assertEqual(first.info.model_version, "old")
+
+    def test_cancel_racing_completion_keeps_single_consistent_terminal_info(self):
+        model = GateModel(version="race")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            future = executor.submit(linear_sample((1, 2, 3, 4)), timeout=None)
+            self.assertTrue(model.entered.wait(1))
+            model.release.set()
+            future.result(1)
+            # Completion won; a late cancel cannot rewrite the terminal info.
+            self.assertFalse(executor.cancel(future.request_id))
+
+        info = future.info
+        self.assertEqual(info.state, RequestState.FINISHED)
+        self.assertEqual(info.model_version, "race")
+        self.assertEqual(future.info, info)
+        states = {snap.state for snap in future.history}
+        self.assertNotIn(RequestState.CANCELLED, states)
+
     def test_builtin_model_matches_serial_results_and_batches(self):
         model = RecordingLinearModel()
         config = ExecutorConfig(max_batch_size=4, max_wait_time=0.08)

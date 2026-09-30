@@ -15,7 +15,7 @@ from .errors import (
     RequestTimeoutError,
 )
 from .models import Model
-from .types import PredictionFuture, Request, RequestState
+from .types import ExecutionInfo, PredictionFuture, Request, RequestState
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,7 @@ class _Entry:
     future: PredictionFuture
     deadline: Optional[float]
     enqueued_at: float = 0.0
+    batch_id: Optional[int] = None
 
 
 class DynamicBatchingExecutor:
@@ -59,6 +60,8 @@ class DynamicBatchingExecutor:
         self._batch_in_flight = 0
         self._running_entries: list[_Entry] = []
         self._pending_reload: tuple[Optional[Model], Optional[float]] = (None, None)
+        self._next_batch_id = 0
+        self._resolved: dict[str, ExecutionInfo] = {}
 
     @property
     def model(self) -> Model:
@@ -69,6 +72,20 @@ class DynamicBatchingExecutor:
     def queue_size(self) -> int:
         with self._condition:
             return len(self._queue)
+
+    def info(self, request_id: str) -> Optional[ExecutionInfo]:
+        """Return the request's current execution attribution snapshot.
+
+        Falls back to the future itself once the executor has dropped its
+        tracking entry, so terminal attribution stays readable after batch
+        completion or shutdown.
+        """
+        with self._condition:
+            entry = self._entries.get(request_id)
+            if entry is not None:
+                return entry.future.info
+            return self._resolved.get(request_id)
+        return None
 
     def start(self) -> "DynamicBatchingExecutor":
         with self._condition:
@@ -108,17 +125,25 @@ class DynamicBatchingExecutor:
     def cancel(self, request_id: str) -> bool:
         """Cancel a queued/running request without changing other result order."""
         with self._condition:
+            # Admitting into a batch happens under this same lock, so the
+            # request cannot jump from queued to bound mid-cancel.
             entry = self._entries.pop(request_id, None)
-            if entry is not None:
-                try:
-                    self._queue.remove(entry)
-                except ValueError:
-                    pass
-        if entry is None:
-            return False
-        return entry.future.cancel(
-            RequestCancelledError("request cancelled before result delivery")
-        )
+            if entry is None:
+                return False
+            queued = True
+            try:
+                self._queue.remove(entry)
+            except ValueError:
+                # Already admitted to an in-flight batch: keep it tracked so
+                # batch cleanup still records its terminal snapshot.
+                queued = False
+                self._entries[request_id] = entry
+            cancelled = entry.future.cancel(
+                RequestCancelledError("request cancelled before result delivery")
+            )
+            if cancelled and queued:
+                self._resolved[request_id] = entry.future.info
+            return cancelled
 
     def reload_model(
         self,
@@ -181,6 +206,11 @@ class DynamicBatchingExecutor:
                 EngineStoppedError("executor stopped before request completed"),
                 RequestState.FAILED,
             )
+        with self._condition:
+            for entry in queued:
+                self._resolved[entry.request.request_id] = entry.future.info
+            for entry in leftovers:
+                self._resolved[entry.request.request_id] = entry.future.info
 
     def __enter__(self) -> "DynamicBatchingExecutor":
         return self.start()
@@ -214,6 +244,16 @@ class DynamicBatchingExecutor:
                         if ready or waited_enough:
                             model = self._model
                             batch = self._take_batch_locked(anchor.request.batching_key)
+                            batch_id = self._next_batch_id
+                            self._next_batch_id += 1
+                            for position, entry in enumerate(batch):
+                                entry.batch_id = batch_id
+                                entry.future.bind_batch(
+                                    batch_id,
+                                    model.name,
+                                    model.version,
+                                    position,
+                                )
                             self._batch_in_flight += 1
                             self._running_entries.extend(batch)
                             break
@@ -231,7 +271,10 @@ class DynamicBatchingExecutor:
                     if entry in self._running_entries:
                         self._running_entries.remove(entry)
                 for entry in batch:
-                    self._entries.pop(entry.request.request_id, None)
+                    request_id = entry.request.request_id
+                    self._entries.pop(request_id, None)
+                    if entry.future.done():
+                        self._resolved[request_id] = entry.future.info
                 self._apply_reload_locked()
 
     def _take_batch_locked(self, key: tuple[type, tuple[int, ...]]) -> list[_Entry]:
@@ -277,7 +320,6 @@ class DynamicBatchingExecutor:
             except Exception as exc:
                 entry.future.set_exception(exc, RequestState.FAILED)
                 continue
-            entry.future.mark_running()
             active.append(entry)
 
         active = self._fail_timed_out(active, "request timed out before execution")
@@ -365,6 +407,7 @@ class DynamicBatchingExecutor:
                 RequestTimeoutError("request timed out while queued"),
                 RequestState.TIMED_OUT,
             )
+            self._resolved[entry.request.request_id] = entry.future.info
 
     def _apply_reload_locked(self) -> None:
         replacement, deadline = self._pending_reload
