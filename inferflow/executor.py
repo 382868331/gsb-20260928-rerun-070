@@ -13,6 +13,7 @@ from .errors import (
     QueueFullError,
     RequestCancelledError,
     RequestTimeoutError,
+    VersionContractError,
 )
 from .models import Model
 from .types import BatchAttribution, PredictionFuture, Request, RequestState
@@ -105,6 +106,46 @@ class DynamicBatchingExecutor:
             self._entries[request.request_id] = entry
             self._condition.notify_all()
         return future
+
+    def submit_group(
+        self,
+        requests: Sequence[Request],
+        same_version: bool = True,
+        timeout: Optional[float] = -1,
+    ):
+        from .groups import RequestGroup
+        from .types import VersionContract
+
+        with self._condition:
+            if self._stopped or not self._running:
+                raise EngineStoppedError("executor is not running")
+        group_requests = list(requests)
+        with self._condition:
+            pinned_version = self._model.version
+        required_version = pinned_version if same_version else None
+        prepared: list[Request] = []
+        for request in group_requests:
+            if same_version and request.required_model_version not in (None, required_version):
+                raise VersionContractError(
+                    f"request requires {request.required_model_version!r}; group pins {required_version!r}"
+                )
+            prepared.append(
+                Request(
+                    data=request.data,
+                    shape=request.shape,
+                    dtype=request.dtype,
+                    priority=request.priority,
+                    required_model_version=required_version,
+                    request_id=request.request_id,
+                )
+            )
+        return RequestGroup(
+            self,
+            prepared,
+            VersionContract.SAME_VERSION if same_version else VersionContract.CURRENT_VERSION,
+            pinned_version=pinned_version if same_version else None,
+            submit_timeout=timeout,
+        )
 
     def cancel(self, request_id: str) -> bool:
         """Cancel a queued/running request without changing other result order."""
@@ -200,11 +241,17 @@ class DynamicBatchingExecutor:
                         return
                     self._expire_requests_locked()
                     self._apply_reload_locked()
-                    if self._queue:
-                        anchor = self._select_anchor_locked()
+                    executable = [
+                        entry
+                        for entry in self._queue
+                        if entry.request.required_model_version is None
+                        or entry.request.required_model_version == self._model.version
+                    ]
+                    if executable:
+                        anchor = min(executable, key=self._scheduling_key_locked)
                         compatible = [
                             entry
-                            for entry in self._queue
+                            for entry in executable
                             if entry.request.batching_key == anchor.request.batching_key
                         ]
                         ready = len(compatible) >= self._config.max_batch_size
@@ -221,7 +268,7 @@ class DynamicBatchingExecutor:
                         if batch_deadline is None:
                             batch_deadline = self._clock() + self._config.max_wait_time
                     wait_for = self._config.max_wait_time
-                    if self._queue and batch_deadline is not None:
+                    if executable and batch_deadline is not None:
                         wait_for = min(wait_for, max(0.0, batch_deadline - self._clock()))
                     self._condition.wait(wait_for)
 

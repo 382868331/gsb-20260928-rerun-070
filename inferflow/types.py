@@ -24,6 +24,27 @@ class Priority(IntEnum):
     HIGH = 2
 
 
+class VersionContract(Enum):
+    """Model-version delivery agreement for a request group."""
+
+    SAME_VERSION = "same_version"
+    CURRENT_VERSION = "current_version"
+
+
+class GroupState(Enum):
+    WAITING = "waiting"
+    EXECUTED = "executed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ItemState(Enum):
+    WAITING = "waiting"
+    EXECUTED = "executed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 @dataclass(frozen=True)
 class BatchAttribution:
     """Execution ownership of a request once it enters a batch.
@@ -52,6 +73,7 @@ class Request:
     shape: tuple[int, ...]
     dtype: type = float
     priority: Priority = Priority.NORMAL
+    required_model_version: Optional[str] = None
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property

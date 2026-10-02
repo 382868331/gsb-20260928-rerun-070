@@ -81,6 +81,35 @@ failure leaves the active model untouched. When loading succeeds, the worker
 finishes every already executing batch with the captured old model, then uses
 the replacement for subsequent batches.
 
+## Request groups and delivery contracts
+
+`submit_group(requests, same_version=True)` returns a `RequestGroup`. The
+default contract captures the active model version and makes every queued item
+eligible only for that exact version. Pass `same_version=False` when callers
+explicitly accept that some items may execute before a model switch and others
+after it.
+
+`group.report()` and `group.wait()` return an immutable `GroupReport` containing
+one `ItemReport` per request. Item states are `WAITING`, `EXECUTED`, `FAILED`,
+or `CANCELLED`; each executed item keeps its batch ID and model-version
+attribution. A same-version group is never marked successfully complete after
+observing more than one model version. The `CURRENT_VERSION` contract records a
+version split separately in `executed_versions` without treating it as a
+contract violation.
+
+After a failed item, `retry_unfinished()` submits replacement futures only for
+failed or timed-out items and preserves completed items. If the active model no
+longer matches a pinned group, the call raises `VersionContractError`; callers
+can either reload the required model or explicitly confirm the change with
+`retry_unfinished(allow_version_switch=True)`. `cancel_remaining()` cancels
+every still-unfinished item. Items already in a batch retain that batch's
+attribution even when cancellation wins delivery.
+
+`group.save(path)` writes a stable JSON snapshot through `GroupStore`. The
+snapshot records explicit failed and cancelled items, so reloading with
+`GroupStore().load(path)` cannot later report a complete group while hiding an
+unexplained failure. Reopened reports are read-only.
+
 ## Tests
 
 ```bash

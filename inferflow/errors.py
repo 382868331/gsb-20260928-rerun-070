@@ -24,3 +24,7 @@ class EngineStoppedError(InferflowError):
 
 class ModelReloadError(InferflowError):
     """Raised when loading a replacement model fails."""
+
+
+class VersionContractError(InferflowError):
+    """Raised when a retry cannot honor the group's model-version contract."""

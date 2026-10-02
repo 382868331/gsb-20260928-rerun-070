@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import threading
 import time
+import tempfile
 import unittest
+from pathlib import Path
 
 from inferflow import (
     AddConstantModel,
@@ -18,6 +20,10 @@ from inferflow import (
     RequestCancelledError,
     RequestState,
     RequestTimeoutError,
+    GroupState,
+    GroupStore,
+    ItemState,
+    VersionContractError,
 )
 
 
@@ -56,6 +62,19 @@ class RecordingLinearModel(LinearModel):
     def predict(self, samples):
         self.batches.append(list(samples))
         return super().predict(samples)
+
+
+class VersionedShapeModel:
+    def __init__(self, version):
+        self.name = "versioned-shape"
+        self.version = version
+
+    def check(self, request_shape, dtype):
+        if self.version == "old" and tuple(request_shape) != (3,):
+            raise IncompatibleInputError("old version only accepts shape (3,)")
+
+    def predict(self, samples):
+        return [(self.version, tuple(sample)) for sample in samples]
 
 
 class ExecutorTests(unittest.TestCase):
@@ -310,6 +329,187 @@ class AttributionTests(unittest.TestCase):
                 future.history,
                 (RequestState.QUEUED, RequestState.RUNNING, RequestState.FINISHED),
             )
+
+
+class RequestGroupTests(unittest.TestCase):
+    def test_same_version_group_reports_each_item_and_pins_version(self):
+        model = AddConstantModel(input_shape=(3,), version="old")
+        config = ExecutorConfig(max_batch_size=2, max_wait_time=0.02)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0, 6.0), (3,)),
+                ]
+            )
+            report = group.wait(1)
+
+        self.assertEqual(report.state, GroupState.EXECUTED)
+        self.assertTrue(report.complete)
+        self.assertTrue(report.version_conformant)
+        self.assertEqual(report.pinned_version, "old")
+        self.assertEqual(report.executed_versions, ("old",))
+        self.assertEqual([item.state for item in report.items], [ItemState.EXECUTED] * 2)
+        self.assertTrue(all(item.attribution.model_version == "old" for item in report.items))
+
+    def test_current_version_contract_allows_reload_boundary_split(self):
+        old = GateModel(version="old")
+        new = GateModel(version="new")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(old, config) as executor:
+            group = executor.submit_group(
+                [
+                    linear_sample((1, 2, 3, 4)),
+                    linear_sample((5, 6, 7, 8)),
+                ],
+                same_version=False,
+            )
+            self.assertTrue(old.entered.wait(1))
+            reloaded = threading.Event()
+
+            def reload():
+                executor.reload_model(new, timeout=2)
+                reloaded.set()
+
+            threading.Thread(target=reload, daemon=True).start()
+            time.sleep(0.03)
+            old.release.set()
+            self.assertTrue(new.entered.wait(1))
+            new.release.set()
+            report = group.wait(2)
+
+        self.assertTrue(reloaded.is_set())
+        self.assertEqual(report.state, GroupState.EXECUTED)
+        self.assertTrue(report.version_conformant)
+        self.assertEqual(report.executed_versions, ("old", "new"))
+        self.assertEqual(report.items[0].attribution.model_version, "old")
+        self.assertEqual(report.items[1].attribution.model_version, "new")
+
+    def test_pinned_retry_is_rejected_then_accepted_after_explicit_confirmation(self):
+        old = VersionedShapeModel("old")
+        new = VersionedShapeModel("new")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.01)
+        with DynamicBatchingExecutor(old, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0), (2,)),
+                ]
+            )
+            failed_report = group.wait(1)
+            self.assertEqual(failed_report.state, GroupState.FAILED)
+            executor.reload_model(new, timeout=1)
+
+            with self.assertRaises(VersionContractError):
+                group.retry_unfinished()
+            rejected = group.refresh()
+            self.assertEqual(rejected.state, GroupState.FAILED)
+            self.assertEqual(rejected.items[0].state, ItemState.EXECUTED)
+            self.assertEqual(rejected.items[0].result, ("old", (1.0, 2.0, 3.0)))
+            self.assertEqual(rejected.items[0].attribution.model_version, "old")
+            self.assertEqual(rejected.items[1].state, ItemState.FAILED)
+
+            confirmed = group.retry_unfinished(allow_version_switch=True)
+            self.assertEqual(confirmed.items[0].state, ItemState.EXECUTED)
+            self.assertEqual(confirmed.items[1].state, ItemState.WAITING)
+            final_report = group.wait(1)
+
+        self.assertEqual(final_report.state, GroupState.EXECUTED)
+        self.assertEqual(final_report.items[1].result, ("new", (4.0, 5.0)))
+        self.assertEqual(final_report.items[1].attribution.model_version, "new")
+        self.assertEqual(
+            [attempt.model_version for attempt in final_report.items[1].attempts],
+            ["old", "new"],
+        )
+
+    def test_cancel_remaining_preserves_completed_and_failed_records(self):
+        class CancelGateModel:
+            def __init__(self):
+                self.name = "versioned-shape"
+                self.version = "old"
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.predictions = 0
+
+            def check(self, request_shape, dtype):
+                if tuple(request_shape) != (3,):
+                    raise IncompatibleInputError("only shape (3,) succeeds")
+
+            def predict(self, samples):
+                self.predictions += 1
+                if self.predictions == 2:
+                    self.entered.set()
+                    self.release.wait(2)
+                return [(self.version, tuple(sample)) for sample in samples]
+
+        old = CancelGateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(old, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0), (2,)),
+                    Request((7.0, 8.0, 9.0), (3,)),
+                ]
+            )
+            self.assertTrue(old.entered.wait(1))
+            report = group.cancel_remaining()
+            old.release.set()
+
+        self.assertEqual(report.state, GroupState.FAILED)
+        self.assertEqual([item.state for item in report.items], [
+            ItemState.EXECUTED,
+            ItemState.FAILED,
+            ItemState.CANCELLED,
+        ])
+        self.assertEqual(report.items[0].attribution.model_version, "old")
+        self.assertIsNotNone(report.items[2].attribution)
+
+    def test_stop_marks_waiting_group_failed_with_stable_attribution(self):
+        model = GateModel(version="old")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        executor = DynamicBatchingExecutor(model, config).start()
+        group = executor.submit_group(
+            [
+                linear_sample((1, 2, 3, 4)),
+                linear_sample((5, 6, 7, 8)),
+            ]
+        )
+        self.assertTrue(model.entered.wait(1))
+        executor.stop(timeout=0.05)
+        report = group.refresh()
+        self.assertEqual([item.state for item in report.items], [ItemState.FAILED] * 2)
+        self.assertEqual(report.state, GroupState.FAILED)
+        self.assertEqual(report.items[0].attribution.model_version, "old")
+        self.assertIsNone(report.items[1].attribution)
+        model.release.set()
+
+    def test_saved_failed_group_reopens_without_completion_contradiction(self):
+        old = VersionedShapeModel("old")
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.01)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "group.json"
+            with DynamicBatchingExecutor(old, config) as executor:
+                group = executor.submit_group(
+                    [
+                        Request((1.0, 2.0, 3.0), (3,)),
+                        Request((4.0, 5.0), (2,)),
+                    ]
+                )
+                group.wait(1)
+                saved = group.save(path)
+                self.assertEqual(saved.state, GroupState.FAILED)
+
+            reopened = GroupStore().load(path)
+            first_read = reopened.report()
+            second_read = reopened.report()
+
+        self.assertFalse(first_read.complete)
+        self.assertEqual(first_read, second_read)
+        self.assertEqual(first_read.state, GroupState.FAILED)
+        self.assertEqual(first_read.items[0].state, ItemState.EXECUTED)
+        self.assertEqual(first_read.items[1].state, ItemState.FAILED)
+        self.assertIsNotNone(first_read.items[1].error)
 
     def test_cancelled_queued_request_has_no_attribution(self):
         model = GateModel()
