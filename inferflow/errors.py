@@ -24,3 +24,7 @@ class EngineStoppedError(InferflowError):
 
 class ModelReloadError(InferflowError):
     """Raised when loading a replacement model fails."""
+
+
+class VersionConflictError(InferflowError):
+    """Raised when a pinned-version group cannot be served by the active model."""

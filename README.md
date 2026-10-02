@@ -45,6 +45,36 @@ order, so any queued request is served within a bounded time.
 `stop()` fails every still-queued request with `EngineStoppedError` and, if
 the worker cannot finish an in-flight batch before the join timeout, fails
 those requests too; no future is left waiting forever.
+## Request groups and delivery contracts
+
+Callers can submit a set of related requests as one `RequestGroup` under an
+explicit delivery contract (`VersionPolicy`):
+
+- `PINNED`: every item must execute on the model version active at
+  submission. If a reload splits the group across versions, the group
+  conclusion is `CONTRACT_VIOLATED` — it never claims the uniform-version
+  contract was met.
+- `FLEXIBLE`: each item may run on whichever version is current when its
+  batch forms; mixed versions are expected and still conclude `COMPLETED`.
+
+`group.report()` returns an immutable `GroupReport` with one
+`GroupItemReport` per request (queued/running/finished/failed/cancelled,
+result or a mandatory explanation, plus batch/version attribution) and a
+stable group conclusion: `IN_PROGRESS`, `COMPLETED`, `COMPLETED_PARTIAL`,
+`CONTRACT_VIOLATED`, or `CANCELLED`.
+
+After failures, `resubmit_unfinished()` retries only items that ended
+without a result — finished items keep their original batch and version
+identity — while `cancel_remaining()` cancels everything still pending. For
+PINNED groups, resubmission is rejected with `VersionConflictError` when the
+pinned version is no longer active, unless the caller explicitly reconfirms
+with `confirm_version_change=True`, which amends the contract and records
+the amendment in later reports.
+
+`JsonGroupStore` persists reports as JSON. Loading recomputes the conclusion
+from the stored items, so a group can never reopen as completed while
+still containing unexplained failed items, and repeated queries return the
+same verdict.
 
 ## Built-in models
 

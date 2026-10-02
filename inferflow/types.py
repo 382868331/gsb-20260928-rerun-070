@@ -84,6 +84,12 @@ class PredictionFuture:
             return self._attribution
 
     @property
+    def exception(self) -> Optional[BaseException]:
+        """The failure/cancellation cause, or None for unfinished/successful futures."""
+        with self._lock:
+            return self._exception
+
+    @property
     def history(self) -> tuple[RequestState, ...]:
         """Ordered state transitions, e.g. QUEUED -> RUNNING -> FINISHED."""
         with self._lock:

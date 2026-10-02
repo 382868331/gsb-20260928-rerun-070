@@ -15,8 +15,17 @@ from .errors import (
     QueueFullError,
     RequestCancelledError,
     RequestTimeoutError,
+    VersionConflictError,
 )
 from .executor import DynamicBatchingExecutor, ExecutorConfig
+from .groups import (
+    GroupConclusion,
+    GroupItemReport,
+    GroupReport,
+    JsonGroupStore,
+    RequestGroup,
+    VersionPolicy,
+)
 from .models import AddConstantModel, LinearModel, Model
 from .types import (
     BatchAttribution,
@@ -32,7 +41,11 @@ __all__ = [
     "DynamicBatchingExecutor",
     "EngineStoppedError",
     "ExecutorConfig",
+    "GroupConclusion",
+    "GroupItemReport",
+    "GroupReport",
     "IncompatibleInputError",
+    "JsonGroupStore",
     "LinearModel",
     "Model",
     "ModelReloadError",
@@ -41,6 +54,9 @@ __all__ = [
     "QueueFullError",
     "Request",
     "RequestCancelledError",
+    "RequestGroup",
     "RequestState",
     "RequestTimeoutError",
+    "VersionConflictError",
+    "VersionPolicy",
 ]
