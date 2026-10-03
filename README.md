@@ -110,6 +110,37 @@ snapshot records explicit failed and cancelled items, so reloading with
 `GroupStore().load(path)` cannot later report a complete group while hiding an
 unexplained failure. Reopened reports are read-only.
 
+## Redundant execution with one delivery decision
+
+`submit_group(..., hedge=HedgeConfig(...))` adds hedged executions that stay
+within the same request item. Each execution is a separate *candidate* with
+its own role (`primary` / `hedge-N`), model attribution, and recorded result;
+the item never adopts the second candidate's identity when that candidate
+returns first, and two candidates never count as two completed items.
+
+- `HedgeDelivery.FIRST_CONFORMING` (default) adopts the first candidate whose
+  result satisfies the group's model-version agreement; pending hedges are then
+  withdrawn. A faster candidate bound to an ineligible version is recorded but
+  never silently downgraded into the delivery.
+- `HedgeDelivery.CONSISTENT` waits for two conforming candidates and delivers
+  only when their results compare equal. `redundant_results_mismatch`,
+  `model_version_ineligible`, and `insufficient_conforming_results` are exposed
+  on `ItemReport.unmet_reason` while the delivery conditions stay unsatisfied.
+- `HedgeConfig.budget` bounds only the extra, group-wide executions.
+  `GroupReport.hedge_budget` separates candidates still `pending`, already
+  `committed` to the executor, and `completed` work. Withdrawing a candidate
+  that never started returns its budget slot; an execution that entered a batch
+  is irrevocable and keeps its attribution even when cancellation wins.
+- The adoption decision is immutable: candidate records arriving afterwards
+  are retained in the report but never retrigger delivery or change the group
+  conclusion. `cancel_remaining()`, model withdrawal, and shutdown all preserve
+  a fixed delivery while recording which executions could no longer be undone.
+- Snapshots include every candidate and the single `DeliveryRecord`; a
+  reopened hedged group returns the same decision on repeated queries.
+  `retry_unfinished()` re-runs only items without a delivery under the same
+  contract and never resubmits confirmed items. Groups created without a
+  `HedgeConfig` keep the previous single-execution behavior unchanged.
+
 ## Tests
 
 ```bash

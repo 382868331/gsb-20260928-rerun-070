@@ -31,6 +31,23 @@ class VersionContract(Enum):
     CURRENT_VERSION = "current_version"
 
 
+class HedgeDelivery(Enum):
+    """When a hedged request item may be delivered."""
+
+    FIRST_CONFORMING = "first_conforming"
+    CONSISTENT = "consistent"
+
+
+class CandidateState(Enum):
+    """Lifecycle of one redundant execution within a request item."""
+
+    PENDING = "pending"
+    COMMITTED = "committed"
+    FINISHED = "finished"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class GroupState(Enum):
     WAITING = "waiting"
     EXECUTED = "executed"
@@ -93,6 +110,18 @@ class PredictionFuture:
         self._exception: Optional[BaseException] = None
         self._attribution: Optional[BatchAttribution] = None
         self._history: list[RequestState] = [RequestState.QUEUED]
+        self._done_callbacks: list = []
+
+    def add_done_callback(self, callback) -> None:
+        """Invoke ``callback(future)`` exactly once when the future settles."""
+        with self._lock:
+            if not self._event.is_set():
+                self._done_callbacks.append(callback)
+                return
+        try:
+            callback(self)
+        except Exception:
+            pass
 
     @property
     def state(self) -> RequestState:
@@ -164,7 +193,14 @@ class PredictionFuture:
             self._exception = exception
             self._history.append(state)
             self._event.set()
-            return True
+            callbacks = list(self._done_callbacks)
+            self._done_callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback(self)
+            except Exception:
+                pass
+        return True
 
     def __repr__(self) -> str:  # pragma: no cover - debugging helper
         return f"PredictionFuture(request_id={self.request_id!r}, state={self._state.value})"

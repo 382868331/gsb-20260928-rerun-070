@@ -22,7 +22,10 @@ from inferflow import (
     RequestTimeoutError,
     GroupState,
     GroupStore,
+    HedgeConfig,
+    HedgeDelivery,
     ItemState,
+    CandidateState,
     VersionContractError,
 )
 
@@ -629,6 +632,224 @@ class RequestGroupTests(unittest.TestCase):
             future.history,
             (RequestState.QUEUED, RequestState.RUNNING, RequestState.FINISHED),
         )
+
+
+class CountingSlowModel:
+    def __init__(self, version="slow-v1"):
+        self.name = "slow"
+        self.version = version
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def check(self, request_shape, dtype):
+        return None
+
+    def predict(self, samples):
+        with self._lock:
+            self.calls += 1
+        time.sleep(0.05)
+        return [tuple(sample) for sample in samples]
+
+
+class FlakyResultModel:
+    def __init__(self, version="flaky-v1"):
+        self.name = "flaky"
+        self.version = version
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def check(self, request_shape, dtype):
+        return None
+
+    def predict(self, samples):
+        with self._lock:
+            self.calls += 1
+            serial = self.calls
+        time.sleep(0.03)
+        return [(float(serial),) * len(sample) for sample in samples]
+
+
+class HedgeTests(unittest.TestCase):
+    def test_first_conforming_result_delivers_item_once(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=1, delay=0.02),
+            )
+            report = group.wait(2)
+            self.assertEqual(report.state, GroupState.EXECUTED)
+            item = report.items[0]
+            self.assertEqual(item.state, ItemState.EXECUTED)
+            self.assertEqual(item.result, (1.0, 2.0, 3.0))
+            self.assertEqual(item.delivery.mode, HedgeDelivery.FIRST_CONFORMING)
+            delivered_id = item.delivery.candidate_id
+            self.assertEqual(
+                [candidate.role for candidate in item.candidates],
+                ["primary", "hedge-1"],
+            )
+            self.assertEqual(item.candidates[0].candidate_id, delivered_id)
+            self.assertNotEqual(item.candidates[1].candidate_id, delivered_id)
+            # Let the redundant execution finish too; the decision stays fixed.
+            time.sleep(0.1)
+            settled = group.report()
+            self.assertEqual(settled.items[0].delivery.candidate_id, delivered_id)
+            self.assertEqual(
+                [candidate.state for candidate in settled.items[0].candidates],
+                [CandidateState.FINISHED, CandidateState.FINISHED],
+            )
+            self.assertEqual(
+                [candidate.batch_id for candidate in settled.items[0].candidates if candidate.batch_id],
+                [candidate.batch_id for candidate in settled.items[0].candidates if candidate.batch_id],
+            )
+            self.assertNotEqual(
+                settled.items[0].candidates[0].batch_id,
+                settled.items[0].candidates[1].batch_id,
+            )
+
+    def test_consistent_contract_requires_two_equal_results(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(
+                    budget=1,
+                    delivery=HedgeDelivery.CONSISTENT,
+                    delay=0.01,
+                ),
+            )
+            report = group.wait(2)
+        item = report.items[0]
+        self.assertEqual(report.state, GroupState.EXECUTED)
+        self.assertEqual(item.delivery.mode, HedgeDelivery.CONSISTENT)
+        self.assertEqual(item.delivery.reason, "consistent_results")
+        self.assertEqual(item.result, (1.0, 2.0, 3.0))
+        self.assertEqual(
+            [candidate.state for candidate in item.candidates],
+            [CandidateState.FINISHED, CandidateState.FINISHED],
+        )
+
+    def test_consistent_contract_reports_mismatch_without_delivery(self):
+        model = FlakyResultModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(
+                    budget=1,
+                    delivery=HedgeDelivery.CONSISTENT,
+                    delay=0.005,
+                ),
+            )
+            report = group.wait(2)
+        self.assertEqual(report.state, GroupState.FAILED)
+        item = report.items[0]
+        self.assertIsNone(item.delivery)
+        self.assertEqual(item.unmet_reason, "redundant_results_mismatch")
+        self.assertEqual(item.state, ItemState.FAILED)
+        self.assertIsNone(item.result)
+
+    def test_budget_distinguishes_pending_committed_and_completed(self):
+        model = GateModel(version="slow-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0, 6.0), (3,)),
+                ],
+                hedge=HedgeConfig(budget=2, delay=5.0),
+            )
+            self.assertTrue(model.entered.wait(1))
+            pending_report = group.report()
+            self.assertEqual(pending_report.hedge_budget.total, 2)
+            self.assertEqual(pending_report.hedge_budget.pending, 2)
+            self.assertEqual(pending_report.hedge_budget.committed, 0)
+            self.assertEqual(pending_report.hedge_budget.completed, 0)
+            self.assertEqual(pending_report.hedge_budget.remaining, 0)
+            model.release.set()
+            final = group.wait(2)
+        # Both items finished on the primary; pending hedges were withdrawn.
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        self.assertEqual(final.hedge_budget.pending, 0)
+
+    def test_cancel_marks_uncommitted_candidates_and_fixes_nothing(self):
+        model = GateModel(version="slow-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=1, delay=5.0),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.cancel_remaining()
+            model.release.set()
+            time.sleep(0.05)
+            settled = group.report()
+        self.assertEqual(report.state, GroupState.CANCELLED)
+        self.assertIsNone(report.items[0].delivery)
+        states = {candidate.role: candidate.state for candidate in settled.items[0].candidates}
+        self.assertEqual(states["hedge-1"], CandidateState.CANCELLED)
+        self.assertFalse(settled.items[0].candidates[1].committed)
+
+    def test_saved_hedged_group_keeps_one_fixed_decision(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hedged.json"
+            with DynamicBatchingExecutor(model, config) as executor:
+                group = executor.submit_group(
+                    [Request((1.0, 2.0, 3.0), (3,))],
+                    hedge=HedgeConfig(budget=1, delay=0.02),
+                )
+                delivered = group.wait(2)
+                delivered_id = delivered.items[0].delivery.candidate_id
+                group.save(path)
+
+            reopened = GroupStore().load(path).report()
+            self.assertEqual(reopened.state, GroupState.EXECUTED)
+            self.assertEqual(reopened.hedge_delivery, HedgeDelivery.FIRST_CONFORMING)
+            self.assertEqual(reopened.items[0].delivery.candidate_id, delivered_id)
+            self.assertEqual(len(reopened.items[0].candidates), 2)
+            repeated = GroupStore().load(path).report()
+            self.assertEqual(reopened, repeated)
+
+    def test_retry_unfinished_skips_delivered_items_and_keeps_contract(self):
+        class FailingOnceModel(CountingSlowModel):
+            def __init__(self):
+                super().__init__()
+                self.failed_ids: set[str] = set()
+
+            def predict(self, samples):
+                time.sleep(0.01)
+                outputs = []
+                for sample in samples:
+                    key = tuple(sample)
+                    if key == (2.0, 2.0, 2.0) and key not in self.failed_ids:
+                        self.failed_ids.add(key)
+                        raise RuntimeError("transient failure")
+                    outputs.append(tuple(sample))
+                return outputs
+
+        model = FailingOnceModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 1.0, 1.0), (3,)),
+                    Request((2.0, 2.0, 2.0), (3,)),
+                ],
+                hedge=HedgeConfig(budget=1, delay=0.005),
+            )
+            first = group.wait(2)
+            delivered_id = first.items[0].delivery.candidate_id
+            group.retry_unfinished()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        self.assertEqual(final.items[0].delivery.candidate_id, delivered_id)
+        self.assertIsNotNone(final.items[1].delivery)
 
 
 if __name__ == "__main__":

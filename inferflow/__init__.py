@@ -18,11 +18,22 @@ from .errors import (
     VersionContractError,
 )
 from .executor import DynamicBatchingExecutor, ExecutorConfig
-from .groups import GroupReport, GroupStore, ItemReport, RequestGroup
+from .groups import (
+    CandidateReport,
+    DeliveryRecord,
+    GroupReport,
+    GroupStore,
+    HedgeBudgetReport,
+    HedgeConfig,
+    ItemReport,
+    RequestGroup,
+)
 from .models import AddConstantModel, LinearModel, Model
 from .types import (
     BatchAttribution,
+    CandidateState,
     GroupState,
+    HedgeDelivery,
     ItemState,
     PredictionFuture,
     Priority,
@@ -34,12 +45,18 @@ from .types import (
 __all__ = [
     "AddConstantModel",
     "BatchAttribution",
+    "CandidateReport",
+    "CandidateState",
+    "DeliveryRecord",
     "DynamicBatchingExecutor",
     "EngineStoppedError",
     "ExecutorConfig",
     "GroupReport",
     "GroupState",
     "GroupStore",
+    "HedgeBudgetReport",
+    "HedgeConfig",
+    "HedgeDelivery",
     "ItemReport",
     "ItemState",
     "IncompatibleInputError",

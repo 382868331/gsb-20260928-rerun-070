@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, Any, Optional
 from .errors import EngineStoppedError, RequestCancelledError, VersionContractError
 from .types import (
     BatchAttribution,
+    CandidateState,
     GroupState,
+    HedgeDelivery,
     ItemState,
-    PredictionFuture,
     Request,
     RequestState,
     VersionContract,
@@ -21,6 +22,69 @@ from .types import (
 
 if TYPE_CHECKING:
     from .executor import DynamicBatchingExecutor
+
+
+@dataclass(frozen=True)
+class HedgeConfig:
+    """Redundant-execution policy shared by every item of a group.
+
+    ``budget`` bounds the *extra* executions beyond each item's primary
+    attempt for the whole group. ``delivery`` selects the delivery contract:
+    the first conforming candidate, or two conforming candidates checked for
+    equal content.
+    """
+
+    budget: int = 1
+    delivery: HedgeDelivery = HedgeDelivery.FIRST_CONFORMING
+    delay: Optional[float] = None
+    max_hedges_per_item: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CandidateReport:
+    """One redundant execution kept under a single request item."""
+
+    candidate_id: str
+    role: str
+    state: CandidateState
+    model_name: Optional[str] = None
+    model_version: Optional[str] = None
+    batch_id: Optional[str] = None
+    batch_index: Optional[int] = None
+    batch_size: Optional[int] = None
+    result: Any = None
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+    committed: bool = False
+    completed: bool = False
+
+
+@dataclass(frozen=True)
+class DeliveryRecord:
+    """The single, immutable adoption decision for one request item."""
+
+    candidate_id: str
+    mode: HedgeDelivery
+    reason: str
+    result: Any = None
+
+
+@dataclass(frozen=True)
+class HedgeBudgetReport:
+    """Group-wide accounting of redundant execution work."""
+
+    total: int
+    pending: int
+    committed: int
+    completed: int
+
+    @property
+    def used(self) -> int:
+        return self.pending + self.committed + self.completed
+
+    @property
+    def remaining(self) -> int:
+        return self.total - self.used
 
 
 @dataclass(frozen=True)
@@ -33,6 +97,9 @@ class ItemReport:
     error_type: Optional[str] = None
     attribution: Optional[BatchAttribution] = None
     attempts: tuple[BatchAttribution, ...] = ()
+    candidates: tuple[CandidateReport, ...] = ()
+    delivery: Optional[DeliveryRecord] = None
+    unmet_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +111,8 @@ class GroupReport:
     version_conformant: bool
     executed_versions: tuple[str, ...]
     items: tuple[ItemReport, ...]
+    hedge_delivery: Optional[HedgeDelivery] = None
+    hedge_budget: Optional[HedgeBudgetReport] = None
 
     @property
     def complete(self) -> bool:
@@ -51,18 +120,64 @@ class GroupReport:
 
 
 @dataclass
+class _Candidate:
+    candidate_id: str
+    role: str
+    request: Optional[Request] = None
+    future: Any = None
+    state: CandidateState = CandidateState.PENDING
+    timer: Any = None
+    error: Optional[BaseException] = None
+
+    @property
+    def committed(self) -> bool:
+        return self.future is not None
+
+    @property
+    def completed_work(self) -> bool:
+        return self.state in (CandidateState.FINISHED, CandidateState.FAILED)
+
+
+@dataclass
 class _GroupItem:
     item_id: str
     request: Request
-    future: PredictionFuture
-    attempts: list[tuple[Request, PredictionFuture]] = field(default_factory=list)
+    primary: _Candidate
+    hedges: list[_Candidate] = field(default_factory=list)
+    delivery: Optional[DeliveryRecord] = None
+    unmet_reason: Optional[str] = None
+    attempts: list = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        self.attempts.append((self.request, self.future))
+    @property
+    def candidates(self) -> list[_Candidate]:
+        return [self.primary, *self.hedges]
+
+    @property
+    def future(self):
+        return self.primary.future
+
+    @property
+    def pending_hedges(self) -> list[_Candidate]:
+        return [hedge for hedge in self.hedges if hedge.state is CandidateState.PENDING]
+
+    @property
+    def outstanding(self) -> list[_Candidate]:
+        live = [
+            candidate
+            for candidate in self.candidates
+            if candidate.committed and not candidate.future.done()
+        ]
+        return live + self.pending_hedges
 
 
 class RequestGroup:
-    """A coordinated set of futures governed by one version agreement."""
+    """A coordinated set of futures governed by one version agreement.
+
+    With a :class:`HedgeConfig` the group may start redundant executions for
+    items that have not returned. Each redundant execution stays a separate
+    candidate of the same item, while each item makes exactly one delivery
+    decision and therefore counts once.
+    """
 
     def __init__(
         self,
@@ -72,6 +187,7 @@ class RequestGroup:
         group_id: Optional[str] = None,
         pinned_version: Optional[str] = None,
         submit_timeout: Optional[float] = -1,
+        hedge: Optional[HedgeConfig] = None,
     ):
         if not requests:
             raise ValueError("request group must contain at least one request")
@@ -82,6 +198,8 @@ class RequestGroup:
         self.pinned_version = pinned_version
         if self.pinned_version is None and contract is VersionContract.SAME_VERSION:
             self.pinned_version = executor.model.version
+        self._hedge = hedge
+        self._hedge_clock = getattr(executor, "_clock", time.monotonic)
         self._items: dict[str, _GroupItem] = {}
         self._saved_reports: dict[str, GroupReport] = {}
         self._submit_timeout = submit_timeout
@@ -90,23 +208,253 @@ class RequestGroup:
             self.pinned_version if contract is VersionContract.SAME_VERSION else None
         )
         for request in requests:
-            submission = request
-            if required_version is not None:
-                if request.required_model_version not in (None, required_version):
-                    raise VersionContractError(
-                        f"request requires model version {request.required_model_version!r}; "
-                        f"group pins {required_version!r}"
-                    )
-                submission = Request(
-                    data=request.data,
-                    shape=request.shape,
-                    dtype=request.dtype,
-                    priority=request.priority,
-                    required_model_version=required_version,
-                    request_id=request.request_id,
+            submission = self._pin_request(request, required_version)
+            primary = _Candidate(
+                candidate_id=uuid.uuid4().hex,
+                role="primary",
+                request=submission,
+            )
+            item = _GroupItem(
+                item_id=submission.request_id,
+                request=submission,
+                primary=primary,
+            )
+            self._items[submission.request_id] = item
+            self._commit_candidate(item, primary)
+
+        if hedge is not None and hedge.budget > 0:
+            self._schedule_hedges()
+
+    def _pin_request(self, request: Request, required_version: Optional[str]) -> Request:
+        if required_version is None:
+            return request
+        if request.required_model_version not in (None, required_version):
+            raise VersionContractError(
+                f"request requires model version {request.required_model_version!r}; "
+                f"group pins {required_version!r}"
+            )
+        return Request(
+            data=request.data,
+            shape=request.shape,
+            dtype=request.dtype,
+            priority=request.priority,
+            required_model_version=required_version,
+            request_id=request.request_id,
+        )
+
+    def _new_hedge_request(self, template: Request) -> Request:
+        required_version = (
+            self.pinned_version if self.contract is VersionContract.SAME_VERSION else None
+        )
+        return Request(
+            data=template.data,
+            shape=template.shape,
+            dtype=template.dtype,
+            priority=template.priority,
+            required_model_version=required_version,
+        )
+
+    # -- redundant execution -------------------------------------------------
+
+    def _schedule_hedges(self) -> None:
+        hedge = self._hedge
+        delay = hedge.delay if hedge.delay is not None else 0.05
+        per_item_cap = hedge.max_hedges_per_item
+        items = list(self._items.values())
+        allocated = 0
+        # Round-robin so a group-wide budget is spread fairly across items.
+        while allocated < hedge.budget:
+            progressed = False
+            for item in items:
+                if allocated >= hedge.budget:
+                    break
+                if per_item_cap is not None and len(item.hedges) >= per_item_cap:
+                    continue
+                index = len(item.hedges)
+                candidate = _Candidate(
+                    candidate_id=uuid.uuid4().hex,
+                    role=f"hedge-{index + 1}",
                 )
-            future = executor.submit(submission, submit_timeout)
-            self._items[submission.request_id] = _GroupItem(submission.request_id, submission, future)
+                item.hedges.append(candidate)
+                allocated += 1
+                progressed = True
+                timer = threading.Timer(
+                    delay * (index + 1),
+                    self._start_hedge,
+                    args=(item.item_id, candidate.candidate_id),
+                )
+                timer.daemon = True
+                candidate.timer = timer
+                timer.start()
+            if not progressed:
+                break
+
+    def _start_hedge(self, item_id: str, candidate_id: str) -> None:
+        with self._lock:
+            if self._executor is None:
+                return
+            item = self._items.get(item_id)
+            if item is None:
+                return
+            candidate = next(
+                (hedge for hedge in item.hedges if hedge.candidate_id == candidate_id),
+                None,
+            )
+            if candidate is None or candidate.state is not CandidateState.PENDING:
+                return
+            # A fixed FIRST-mode delivery no longer needs this execution; a
+            # candidate that never started can be withdrawn and frees budget.
+            if item.delivery is not None:
+                self._withdraw_pending(item, candidate)
+                return
+            if self._hedge.delivery is HedgeDelivery.CONSISTENT and item.delivery is not None:
+                self._withdraw_pending(item, candidate)
+                return
+            try:
+                self._commit_candidate(item, candidate)
+            except EngineStoppedError:
+                candidate.state = CandidateState.FAILED
+                candidate.error = EngineStoppedError(
+                    "executor stopped before redundant execution started"
+                )
+            self._evaluate_item(item)
+
+    def _withdraw_pending(self, item: _GroupItem, candidate: _Candidate) -> None:
+        if candidate.timer is not None:
+            candidate.timer.cancel()
+            candidate.timer = None
+        candidate.state = CandidateState.CANCELLED
+
+    def _commit_candidate(self, item: _GroupItem, candidate: _Candidate) -> None:
+        if candidate.timer is not None:
+            candidate.timer.cancel()
+            candidate.timer = None
+        request = candidate.request
+        if request is None:
+            request = self._new_hedge_request(item.request)
+            candidate.request = request
+        candidate.future = self._executor.submit(request, self._submit_timeout)
+        candidate.state = CandidateState.COMMITTED
+        item.attempts.append((request, candidate.future))
+        candidate.future.add_done_callback(
+            lambda _future, target_item=item.item_id: self._on_candidate_done(target_item)
+        )
+
+    def _on_candidate_done(self, item_id: str) -> None:
+        with self._lock:
+            item = self._items.get(item_id)
+            if item is not None:
+                self._evaluate_item(item)
+
+    def _sync_candidate(self, candidate: _Candidate) -> None:
+        future = candidate.future
+        if future is None or not future.done():
+            return
+        if candidate.state in (
+            CandidateState.FINISHED,
+            CandidateState.FAILED,
+            CandidateState.CANCELLED,
+        ):
+            return
+        if future.state is RequestState.FINISHED:
+            candidate.state = CandidateState.FINISHED
+            candidate.error = None
+        elif future.state is RequestState.CANCELLED:
+            candidate.state = CandidateState.CANCELLED
+        else:
+            candidate.state = CandidateState.FAILED
+            try:
+                future.result(0)
+            except BaseException as exc:  # noqa: BLE001 - recorded per candidate
+                candidate.error = exc
+
+    def _candidate_conforms(self, candidate: _Candidate) -> bool:
+        future = candidate.future
+        if future is None or future.state is not RequestState.FINISHED:
+            return False
+        attribution = future.attribution
+        if attribution is None:
+            return False
+        if self.contract is VersionContract.SAME_VERSION:
+            return attribution.model_version == self.pinned_version
+        return True
+
+    def _evaluate_item(self, item: _GroupItem) -> None:
+        if self._hedge is None:
+            return
+        for candidate in item.candidates:
+            self._sync_candidate(candidate)
+
+        # A fixed adoption decision (or a fixed impossibility) is never
+        # rewritten by execution records arriving afterwards.
+        if item.delivery is not None:
+            self._withdraw_obsolete_pending(item)
+            return
+
+        conforming = [
+            candidate
+            for candidate in item.candidates
+            if self._candidate_conforms(candidate)
+        ]
+
+        if self._hedge.delivery is HedgeDelivery.FIRST_CONFORMING:
+            if conforming:
+                chosen = conforming[0]
+                item.delivery = DeliveryRecord(
+                    candidate_id=chosen.candidate_id,
+                    mode=HedgeDelivery.FIRST_CONFORMING,
+                    reason="first_conforming_result",
+                    result=chosen.future.result(0),
+                )
+                item.unmet_reason = None
+                self._withdraw_obsolete_pending(item)
+                return
+        else:
+            if len(conforming) >= 2:
+                values = [candidate.future.result(0) for candidate in conforming]
+                if all(value == values[0] for value in values[1:]):
+                    chosen = conforming[0]
+                    item.delivery = DeliveryRecord(
+                        candidate_id=chosen.candidate_id,
+                        mode=HedgeDelivery.CONSISTENT,
+                        reason="consistent_results",
+                        result=values[0],
+                    )
+                    item.unmet_reason = None
+                    self._withdraw_obsolete_pending(item)
+                    return
+                if not item.outstanding:
+                    item.unmet_reason = "redundant_results_mismatch"
+                    self._withdraw_obsolete_pending(item)
+                    return
+            if not item.outstanding:
+                if conforming:
+                    item.unmet_reason = "insufficient_conforming_results"
+                elif any(
+                    candidate.state is CandidateState.FINISHED
+                    and candidate.future is not None
+                    and candidate.future.attribution is not None
+                    and not self._version_matches(candidate.future.attribution.model_version)
+                    for candidate in item.candidates
+                ):
+                    item.unmet_reason = "model_version_ineligible"
+                elif all(
+                    candidate.state is CandidateState.CANCELLED
+                    for candidate in item.candidates
+                ):
+                    item.unmet_reason = "all_candidates_cancelled"
+                else:
+                    item.unmet_reason = "insufficient_conforming_results"
+
+    def _version_matches(self, version: str) -> bool:
+        return (
+            self.contract is not VersionContract.SAME_VERSION
+            or version == self.pinned_version
+        )
+
+    def _withdraw_obsolete_pending(self, item: _GroupItem) -> None:
+        for hedge in item.pending_hedges:
+            self._withdraw_pending(item, hedge)
 
     @classmethod
     def from_report(cls, report: GroupReport) -> "RequestGroup":
@@ -116,14 +464,27 @@ class RequestGroup:
         group.group_id = report.group_id
         group.contract = report.contract
         group.pinned_version = report.pinned_version
+        group._hedge = (
+            HedgeConfig(
+                budget=report.hedge_budget.total,
+                delivery=report.hedge_delivery,
+            )
+            if report.hedge_delivery is not None
+            else None
+        )
+        group._hedge_clock = time.monotonic
         group._items = {}
         group._saved_reports = {"reopened": report}
+        group._submit_timeout = None
         return group
 
     def refresh(self) -> GroupReport:
         with self._lock:
             if not self._items:
                 return self._saved_reports["reopened"]
+            if self._hedge is not None:
+                for item in self._items.values():
+                    self._evaluate_item(item)
             reports = tuple(self._item_report(item) for item in self._items.values())
             report = self._build_report(reports)
             return report
@@ -131,20 +492,21 @@ class RequestGroup:
     def report(self) -> GroupReport:
         return self.refresh()
 
+    def budget(self) -> Optional[HedgeBudgetReport]:
+        return self.report().hedge_budget
+
     def wait(self, timeout: Optional[float] = None) -> GroupReport:
         report = self.refresh()
-        deadline = None if timeout is None else time.monotonic() + timeout
-        # Events are per-future. A short polling interval keeps this public API
-        # dependency-free while timeout support remains exact at completion.
+        deadline = None if timeout is None else self._hedge_clock() + timeout
         while not self._terminal(report):
             report = self.refresh()
             if self._terminal(report):
                 break
             if deadline is not None:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - self._hedge_clock()
                 if remaining <= 0:
                     return report
-                threading.Event().wait(min(0.01, remaining))
+                threading.Event().wait(min(0.01, max(0.0, remaining)))
                 continue
             threading.Event().wait(0.01)
         return report
@@ -154,6 +516,13 @@ class RequestGroup:
             if self._executor is None:
                 raise EngineStoppedError("reopened group records cannot be modified")
             for item in self._items.values():
+                if self._hedge is not None:
+                    if item.delivery is not None:
+                        continue
+                    for candidate in item.candidates:
+                        self._cancel_candidate(item, candidate)
+                    self._evaluate_item(item)
+                    continue
                 if not item.future.done():
                     item.future.cancel(
                         RequestCancelledError("remaining group request cancelled")
@@ -161,12 +530,21 @@ class RequestGroup:
                     self._executor.cancel(item.request.request_id)
             return self.report()
 
+    def _cancel_candidate(self, item: _GroupItem, candidate: _Candidate) -> None:
+        if candidate.state is CandidateState.PENDING:
+            self._withdraw_pending(item, candidate)
+            return
+        if candidate.committed and not candidate.future.done():
+            candidate.future.cancel(
+                RequestCancelledError("redundant execution cancelled")
+            )
+            self._executor.cancel(candidate.request.request_id)
+
     def retry_unfinished(self, allow_version_switch: bool = False) -> GroupReport:
-        """Submit replacement futures for failed/timed-out item attempts."""
+        """Submit replacement futures for failed or undelivered items only."""
         with self._lock:
             if self._executor is None:
                 raise EngineStoppedError("reopened group records cannot be modified")
-            report = self.report()
             current_version = self._executor.model.version
             if self.contract is VersionContract.SAME_VERSION and current_version != self.pinned_version:
                 if not allow_version_switch:
@@ -177,36 +555,53 @@ class RequestGroup:
                 self.contract = VersionContract.CURRENT_VERSION
                 self.pinned_version = None
 
-            for item in self._items.values():
-                if item.future.state not in (RequestState.FAILED, RequestState.TIMED_OUT):
-                    continue
-                request = item.request
-                required_version = (
-                    self.pinned_version
-                    if self.contract is VersionContract.SAME_VERSION
-                    else None
-                )
-                if required_version is not None:
-                    request = Request(
-                        data=request.data,
-                        shape=request.shape,
-                        dtype=request.dtype,
-                        priority=request.priority,
-                        required_model_version=required_version,
-                    )
-                else:
-                    request = Request(
-                        data=request.data,
-                        shape=request.shape,
-                        dtype=request.dtype,
-                        priority=request.priority,
-                    )
-                item.request = request
-                item.future = self._executor.submit(request, self._submit_timeout)
-                item.attempts.append((request, item.future))
+            if self._hedge is None:
+                self._retry_legacy()
+            else:
+                self._retry_hedged()
             return self.report()
 
-    def save(self, path: str | Path) -> GroupReport:
+    def _retry_legacy(self) -> None:
+        for item in self._items.values():
+            if item.future.state not in (RequestState.FAILED, RequestState.TIMED_OUT):
+                continue
+            request = self._new_hedge_request(item.request)
+            if self.contract is not VersionContract.SAME_VERSION:
+                request = Request(
+                    data=request.data,
+                    shape=request.shape,
+                    dtype=request.dtype,
+                    priority=request.priority,
+                )
+            item.request = request
+            candidate = _Candidate(
+                candidate_id=uuid.uuid4().hex,
+                role=f"retry-{len(item.attempts)}",
+                request=request,
+            )
+            item.primary = candidate
+            item.hedges = []
+            self._commit_candidate(item, candidate)
+
+    def _retry_hedged(self) -> None:
+        for item in self._items.values():
+            if item.delivery is not None:
+                # An adopted item is never re-run; its decision is fixed.
+                continue
+            request = self._new_hedge_request(item.request)
+            item.request = request
+            candidate = _Candidate(
+                candidate_id=uuid.uuid4().hex,
+                role="primary",
+                request=request,
+            )
+            item.primary = candidate
+            item.hedges = []
+            item.unmet_reason = None
+            self._commit_candidate(item, candidate)
+        self._schedule_hedges()
+
+    def save(self, path) -> GroupReport:
         report = self.report()
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +612,96 @@ class RequestGroup:
         return report
 
     def _item_report(self, item: _GroupItem) -> ItemReport:
-        future = item.future
+        if self._hedge is None:
+            return self._legacy_item_report(item)
+
+        candidates = tuple(self._candidate_report(candidate) for candidate in item.candidates)
+        delivered = item.delivery is not None
+        future = item.primary.future
+        state = ItemState.WAITING
+        result = None
+        error = None
+        error_type = None
+        attribution = None
+        if delivered:
+            state = ItemState.EXECUTED
+            result = item.delivery.result
+            chosen = next(
+                candidate
+                for candidate in item.candidates
+                if candidate.candidate_id == item.delivery.candidate_id
+            )
+            attribution = chosen.future.attribution
+        elif not item.outstanding:
+            if any(
+                candidate.state is CandidateState.CANCELLED
+                and not candidate.committed
+                for candidate in item.candidates
+            ) and all(
+                candidate.state is CandidateState.CANCELLED
+                for candidate in item.candidates
+            ):
+                state = ItemState.CANCELLED
+            elif item.unmet_reason == "all_candidates_cancelled":
+                state = ItemState.CANCELLED
+            elif all(
+                not candidate.committed
+                for candidate in item.candidates
+            ):
+                state = ItemState.CANCELLED
+            else:
+                state = ItemState.FAILED
+                error = item.unmet_reason or "delivery conditions not satisfied"
+                error_type = "DeliveryConditionError"
+        attempts = tuple(
+            attempt.attribution
+            for _, attempt in item.attempts
+            if attempt.attribution is not None
+        )
+        return ItemReport(
+            item_id=item.item_id,
+            request_id=item.item_id,
+            state=state,
+            result=result,
+            error=error,
+            error_type=error_type,
+            attribution=attribution,
+            attempts=attempts,
+            candidates=candidates,
+            delivery=item.delivery,
+            unmet_reason=None if delivered else item.unmet_reason,
+        )
+
+    def _candidate_report(self, candidate: _Candidate) -> CandidateReport:
+        future = candidate.future
+        attribution = future.attribution if future is not None else None
+        result = None
+        error = None
+        error_type = None
+        if future is not None and future.done():
+            try:
+                result = future.result(0)
+            except BaseException as exc:  # noqa: BLE001
+                error = str(exc)
+                error_type = type(exc).__name__
+        return CandidateReport(
+            candidate_id=candidate.candidate_id,
+            role=candidate.role,
+            state=candidate.state,
+            model_name=attribution.model_name if attribution else None,
+            model_version=attribution.model_version if attribution else None,
+            batch_id=attribution.batch_id if attribution else None,
+            batch_index=attribution.batch_index if attribution else None,
+            batch_size=attribution.batch_size if attribution else None,
+            result=result,
+            error=error,
+            error_type=error_type,
+            committed=candidate.committed,
+            completed=candidate.completed_work,
+        )
+
+    def _legacy_item_report(self, item: _GroupItem) -> ItemReport:
+        future = item.primary.future
         state = _item_state(future.state)
         result = None
         error = None
@@ -225,7 +709,7 @@ class RequestGroup:
         if future.done():
             try:
                 result = future.result(0)
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001
                 error = str(exc)
                 error_type = type(exc).__name__
         return ItemReport(
@@ -243,6 +727,25 @@ class RequestGroup:
             ),
         )
 
+    def _hedge_budget(self, reports: tuple[ItemReport, ...]) -> HedgeBudgetReport:
+        pending = 0
+        committed = 0
+        completed = 0
+        for item in self._items.values():
+            for hedge in item.hedges:
+                if hedge.state is CandidateState.PENDING:
+                    pending += 1
+                elif hedge.completed_work:
+                    completed += 1
+                else:
+                    committed += 1
+        return HedgeBudgetReport(
+            total=self._hedge.budget,
+            pending=pending,
+            committed=committed,
+            completed=completed,
+        )
+
     def _build_report(self, reports: tuple[ItemReport, ...]) -> GroupReport:
         versions = tuple(
             dict.fromkeys(
@@ -251,6 +754,15 @@ class RequestGroup:
                 if item.attribution is not None
             )
         )
+        if self._hedge is not None:
+            # Only the version of the uniquely adopted result matters.
+            versions = tuple(
+                dict.fromkeys(
+                    report.attribution.model_version
+                    for report in reports
+                    if report.state is ItemState.EXECUTED and report.attribution is not None
+                )
+            )
         version_conformant = True
         if self.contract is VersionContract.SAME_VERSION:
             expected = self.pinned_version
@@ -285,6 +797,8 @@ class RequestGroup:
             version_conformant=version_conformant,
             executed_versions=versions,
             items=reports,
+            hedge_delivery=self._hedge.delivery if self._hedge is not None else None,
+            hedge_budget=self._hedge_budget(reports) if self._hedge is not None else None,
         )
 
     @staticmethod
@@ -295,10 +809,10 @@ class RequestGroup:
 class GroupStore:
     """JSON-backed group snapshot storage."""
 
-    def save(self, path: str | Path, group: RequestGroup) -> GroupReport:
+    def save(self, path, group: RequestGroup) -> GroupReport:
         return group.save(path)
 
-    def load(self, path: str | Path) -> RequestGroup:
+    def load(self, path) -> RequestGroup:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         return RequestGroup.from_report(_report_from_jsonable(payload))
 
@@ -318,27 +832,62 @@ def _attribution_to_jsonable(value: Optional[BatchAttribution]) -> Optional[dict
 
 
 def _report_to_jsonable(report: GroupReport) -> dict[str, Any]:
-    return {
+    items = []
+    for item in report.items:
+        entry = {
+            "item_id": item.item_id,
+            "request_id": item.request_id,
+            "state": item.state.value,
+            "result": item.result,
+            "error": item.error,
+            "error_type": item.error_type,
+            "attribution": _attribution_to_jsonable(item.attribution),
+            "attempts": [_attribution_to_jsonable(value) for value in item.attempts],
+        }
+        if report.hedge_delivery is not None:
+            entry["unmet_reason"] = item.unmet_reason
+            entry["delivery"] = (
+                None
+                if item.delivery is None
+                else {
+                    "candidate_id": item.delivery.candidate_id,
+                    "mode": item.delivery.mode.value,
+                    "reason": item.delivery.reason,
+                    "result": item.delivery.result,
+                }
+            )
+            entry["candidates"] = [
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "role": candidate.role,
+                    "state": candidate.state.value,
+                    "model_name": candidate.model_name,
+                    "model_version": candidate.model_version,
+                    "batch_id": candidate.batch_id,
+                    "batch_index": candidate.batch_index,
+                    "batch_size": candidate.batch_size,
+                    "result": candidate.result,
+                    "error": candidate.error,
+                    "error_type": candidate.error_type,
+                    "committed": candidate.committed,
+                    "completed": candidate.completed,
+                }
+                for candidate in item.candidates
+            ]
+        items.append(entry)
+    payload = {
         "group_id": report.group_id,
         "contract": report.contract.value,
         "pinned_version": report.pinned_version,
         "state": report.state.value,
         "version_conformant": report.version_conformant,
         "executed_versions": list(report.executed_versions),
-        "items": [
-            {
-                "item_id": item.item_id,
-                "request_id": item.request_id,
-                "state": item.state.value,
-                "result": item.result,
-                "error": item.error,
-                "error_type": item.error_type,
-                "attribution": _attribution_to_jsonable(item.attribution),
-                "attempts": [_attribution_to_jsonable(value) for value in item.attempts],
-            }
-            for item in report.items
-        ],
+        "items": items,
     }
+    if report.hedge_delivery is not None:
+        payload["hedge_delivery"] = report.hedge_delivery.value
+        payload["hedge_budget"] = asdict(report.hedge_budget)
+    return payload
 
 
 def _attribution_from_jsonable(value: Optional[dict[str, Any]]) -> Optional[BatchAttribution]:
@@ -348,26 +897,65 @@ def _attribution_from_jsonable(value: Optional[dict[str, Any]]) -> Optional[Batc
 
 
 def _report_from_jsonable(payload: dict[str, Any]) -> GroupReport:
-    items = tuple(
-        ItemReport(
-            item_id=item["item_id"],
-            request_id=item["request_id"],
-            state=ItemState(item["state"]),
-            result=item.get("result"),
-            error=item.get("error"),
-            error_type=item.get("error_type"),
-            attribution=_attribution_from_jsonable(item.get("attribution")),
-            attempts=tuple(
-                value
-                for value in (
-                    _attribution_from_jsonable(attempt)
-                    for attempt in item.get("attempts", [])
-                )
-                if value is not None
-            ),
-        )
-        for item in payload["items"]
+    hedge_delivery = (
+        HedgeDelivery(payload["hedge_delivery"]) if payload.get("hedge_delivery") else None
     )
+    items = []
+    for item in payload["items"]:
+        candidates = ()
+        delivery = None
+        if hedge_delivery is not None:
+            candidates = tuple(
+                CandidateReport(
+                    candidate_id=candidate["candidate_id"],
+                    role=candidate["role"],
+                    state=CandidateState(candidate["state"]),
+                    model_name=candidate.get("model_name"),
+                    model_version=candidate.get("model_version"),
+                    batch_id=candidate.get("batch_id"),
+                    batch_index=candidate.get("batch_index"),
+                    batch_size=candidate.get("batch_size"),
+                    result=candidate.get("result"),
+                    error=candidate.get("error"),
+                    error_type=candidate.get("error_type"),
+                    committed=candidate.get("committed", False),
+                    completed=candidate.get("completed", False),
+                )
+                for candidate in item.get("candidates", [])
+            )
+            saved_delivery = item.get("delivery")
+            if saved_delivery is not None:
+                delivery = DeliveryRecord(
+                    candidate_id=saved_delivery["candidate_id"],
+                    mode=HedgeDelivery(saved_delivery["mode"]),
+                    reason=saved_delivery["reason"],
+                    result=saved_delivery.get("result"),
+                )
+        items.append(
+            ItemReport(
+                item_id=item["item_id"],
+                request_id=item["request_id"],
+                state=ItemState(item["state"]),
+                result=item.get("result"),
+                error=item.get("error"),
+                error_type=item.get("error_type"),
+                attribution=_attribution_from_jsonable(item.get("attribution")),
+                attempts=tuple(
+                    value
+                    for value in (
+                        _attribution_from_jsonable(attempt)
+                        for attempt in item.get("attempts", [])
+                    )
+                    if value is not None
+                ),
+                candidates=candidates,
+                delivery=delivery,
+                unmet_reason=item.get("unmet_reason"),
+            )
+        )
+    hedge_budget = None
+    if payload.get("hedge_budget"):
+        hedge_budget = HedgeBudgetReport(**payload["hedge_budget"])
     return GroupReport(
         group_id=payload["group_id"],
         contract=VersionContract(payload["contract"]),
@@ -375,5 +963,7 @@ def _report_from_jsonable(payload: dict[str, Any]) -> GroupReport:
         state=GroupState(payload["state"]),
         version_conformant=payload["version_conformant"],
         executed_versions=tuple(payload.get("executed_versions", [])),
-        items=items,
+        items=tuple(items),
+        hedge_delivery=hedge_delivery,
+        hedge_budget=hedge_budget,
     )

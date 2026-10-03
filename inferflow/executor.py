@@ -112,6 +112,7 @@ class DynamicBatchingExecutor:
         requests: Sequence[Request],
         same_version: bool = True,
         timeout: Optional[float] = -1,
+        hedge=None,
     ):
         from .groups import RequestGroup
         from .types import VersionContract
@@ -145,6 +146,7 @@ class DynamicBatchingExecutor:
             VersionContract.SAME_VERSION if same_version else VersionContract.CURRENT_VERSION,
             pinned_version=pinned_version if same_version else None,
             submit_timeout=timeout,
+            hedge=hedge,
         )
 
     def cancel(self, request_id: str) -> bool:
