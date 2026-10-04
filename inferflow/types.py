@@ -31,6 +31,23 @@ class VersionContract(Enum):
     CURRENT_VERSION = "current_version"
 
 
+class DeliveryMode(Enum):
+    """How redundant candidate results are turned into one delivery."""
+
+    FIRST_CONFORMANT = "first_conformant"
+    COMPARE = "compare"
+
+
+class CandidateState(Enum):
+    """Lifecycle of one redundant execution candidate within an item."""
+
+    PENDING = "pending"
+    COMMITTED = "committed"
+    FINISHED = "finished"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class GroupState(Enum):
     WAITING = "waiting"
     EXECUTED = "executed"
@@ -59,6 +76,30 @@ class BatchAttribution:
     model_version: str
     batch_size: int
     batch_index: int
+
+
+@dataclass(frozen=True)
+class HedgePolicy:
+    """Group-wide rules for scheduling redundant executions.
+
+    ``hedge_after`` is the delay before a still-undelivered item may start its
+    redundant candidate. ``max_extra_executions`` is the total budget of extra
+    executions shared by every item in the group, distinguishing work that has
+    been committed from candidates that never leave the pending state.
+    """
+
+    hedge_after: float
+    max_extra_executions: int = 1
+    delivery: DeliveryMode = DeliveryMode.FIRST_CONFORMANT
+    # Optional explicit model-version requirement for the redundant candidate.
+    # Candidates are still checked per-execution against the group contract.
+    hedge_required_version: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.hedge_after < 0:
+            raise ValueError("hedge_after must be non-negative")
+        if self.max_extra_executions < 0:
+            raise ValueError("max_extra_executions must be non-negative")
 
 
 @dataclass(frozen=True)

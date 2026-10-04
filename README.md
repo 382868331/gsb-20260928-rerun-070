@@ -110,6 +110,50 @@ snapshot records explicit failed and cancelled items, so reloading with
 `GroupStore().load(path)` cannot later report a complete group while hiding an
 unexplained failure. Reopened reports are read-only.
 
+## Redundant (hedged) execution
+
+Pass a `HedgePolicy` to `submit_group` to give each request item one primary
+execution plus a redundant candidate that starts when the item stays
+undelivered past `hedge_after` seconds (or immediately when the primary fails
+before any conformant result exists). Both executions belong to the same item:
+each candidate keeps its own id, model/version, start condition, attribution,
+and result, but an item adopts at most one result, so two candidate results are
+never counted as two completed items. Redundant execution needs concurrent
+batch slots; configure `ExecutorConfig(worker_count=...)` greater than one (the
+default of one preserves the original single-worker behavior).
+
+`HedgePolicy.delivery` selects the single delivery decision:
+
+- `DeliveryMode.FIRST_CONFORMANT` (default) delivers the first candidate
+  result whose model version satisfies the group contract. A fast result on a
+  non-matching version is recorded but never silently downgraded into a
+  delivery; the item stays waiting with `candidate_version_not_conformant` in
+  its `unmet_conditions` until a conformant result exists.
+- `DeliveryMode.COMPARE` delivers only once two conformant results agree. A
+  mismatch fixes the item as failed with `results_disagree`; one result (or
+  only failures) leaves `insufficient_conformant_results` until the redundancy
+  budget is exhausted.
+
+The model-version requirement keeps applying to every candidate separately,
+for both contracts.
+
+`max_extra_executions` is the shared group budget for extra executions. The
+group report's `redundancy` (`RedundancyReport`) separates `committed_extra`
+(work already promised to the executor and impossible to revoke once a batch is
+attributed), `pending_extra` (candidates never started), and
+`completed_extra` (extra work that actually finished). `irrevocable_executions`
+counts committed batches that were already attributed when a cancel/stop raced
+them; `fixed_deliveries` lists the items whose adoption decision is already
+locked. After an item adopts a result, still-pending candidates are retired and
+executions that finish afterwards remain recorded on their own candidate with
+`late=True`, never re-triggering delivery or changing the group conclusion.
+
+`retry_unfinished()` on a hedged group resubmits only items without an adopted
+result, continuing the original delivery contract; confirmed items are never
+rerun and keep the same adoption decision across retries, `save`/`load`, and
+repeated queries. Groups created without a `HedgePolicy` keep the original
+behavior exactly.
+
 ## Tests
 
 ```bash

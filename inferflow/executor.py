@@ -25,6 +25,11 @@ class ExecutorConfig:
     max_batch_size: int = 32
     max_wait_time: float = 0.02
     default_timeout: Optional[float] = 5.0
+    # Number of concurrently executing batch slots. Redundant (hedged)
+    # executions need more than one slot so a slow primary batch does not
+    # prevent its hedged copy from starting. The default of one preserves the
+    # original single-worker ordering.
+    worker_count: int = 1
     # Seconds of queue wait that raise a request's effective priority by one
     # level. Lower-priority requests therefore cannot starve under a
     # continuous stream of higher-priority traffic.
@@ -61,6 +66,7 @@ class DynamicBatchingExecutor:
         self._running_entries: list[_Entry] = []
         self._pending_reload: tuple[Optional[Model], Optional[float]] = (None, None)
         self._batch_sequence = 0
+        self._workers: list[threading.Thread] = []
 
     @property
     def model(self) -> Model:
@@ -77,10 +83,12 @@ class DynamicBatchingExecutor:
             if self._running or self._stopped:
                 raise EngineStoppedError("executor cannot be restarted")
             self._running = True
-            self._worker = threading.Thread(
-                target=self._run, name="inferflow-worker", daemon=True
-            )
-            self._worker.start()
+            for index in range(max(1, self._config.worker_count)):
+                worker = threading.Thread(
+                    target=self._run, name=f"inferflow-worker-{index}", daemon=True
+                )
+                worker.start()
+                self._workers.append(worker)
         return self
 
     def submit(self, request: Request, timeout: Optional[float] = -1) -> PredictionFuture:
@@ -112,6 +120,7 @@ class DynamicBatchingExecutor:
         requests: Sequence[Request],
         same_version: bool = True,
         timeout: Optional[float] = -1,
+        hedge=None,
     ):
         from .groups import RequestGroup
         from .types import VersionContract
@@ -145,6 +154,7 @@ class DynamicBatchingExecutor:
             VersionContract.SAME_VERSION if same_version else VersionContract.CURRENT_VERSION,
             pinned_version=pinned_version if same_version else None,
             submit_timeout=timeout,
+            hedge=hedge,
         )
 
     def cancel(self, request_id: str) -> bool:
@@ -201,10 +211,9 @@ class DynamicBatchingExecutor:
                 return
             self._running = False
             self._stopped = True
-            worker = self._worker
             queued = list(self._queue) if reject_queued else []
             self._condition.notify_all()
-        if worker is not None:
+        for worker in self._workers:
             worker.join(timeout)
         for entry in queued:
             entry.future.set_exception(
@@ -259,6 +268,8 @@ class DynamicBatchingExecutor:
                             batch_deadline is not None
                             and self._clock() >= batch_deadline
                         )
+                        # Each formed batch is removed from the queue, so
+                        # concurrent workers never execute the same entries.
                         if ready or waited_enough:
                             model = self._model
                             batch = self._take_batch_locked(anchor.request.batching_key)
@@ -268,6 +279,8 @@ class DynamicBatchingExecutor:
                         if batch_deadline is None:
                             batch_deadline = self._clock() + self._config.max_wait_time
                     wait_for = self._config.max_wait_time
+                    if self._config.worker_count > 1:
+                        wait_for = min(wait_for, 0.005)
                     if executable and batch_deadline is not None:
                         wait_for = min(wait_for, max(0.0, batch_deadline - self._clock()))
                     self._condition.wait(wait_for)
@@ -280,7 +293,9 @@ class DynamicBatchingExecutor:
                         self._running_entries.remove(entry)
                 for entry in batch:
                     self._entries.pop(entry.request.request_id, None)
-                self._apply_reload_locked()
+                if not self._batch_in_flight:
+                    self._apply_reload_locked()
+                self._condition.notify_all()
 
     def _take_batch_locked(self, key: tuple[type, tuple[int, ...]]) -> list[_Entry]:
         compatible = [
@@ -430,10 +445,17 @@ class DynamicBatchingExecutor:
 
     def _apply_reload_locked(self) -> None:
         replacement, deadline = self._pending_reload
-        if replacement is None or self._batch_in_flight:
+        if replacement is None:
             return
-        if deadline is not None and self._clock() >= deadline:
-            self._pending_reload = (None, None)
+        # Batches capture their model object at formation time, so an in-flight
+        # batch keeps executing the old model even when the active model is
+        # swapped. With a single batch slot we still wait for the batch to
+        # finish (the original semantics); with concurrent slots we swap once
+        # any batch using the old model is already in flight, which is what
+        # makes redundant execution across a version boundary possible.
+        if self._batch_in_flight and self._config.worker_count <= 1:
+            if deadline is not None and self._clock() >= deadline:
+                self._pending_reload = (None, None)
             return
         self._model = replacement
         self._pending_reload = (None, None)
