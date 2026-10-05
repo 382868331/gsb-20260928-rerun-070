@@ -24,6 +24,8 @@ from inferflow import (
     GroupStore,
     HedgeConfig,
     HedgeDelivery,
+    HedgeItemSpec,
+    HedgeStrategy,
     ItemState,
     CandidateState,
     VersionContractError,
@@ -850,6 +852,270 @@ class HedgeTests(unittest.TestCase):
         self.assertEqual(final.state, GroupState.EXECUTED)
         self.assertEqual(final.items[0].delivery.candidate_id, delivered_id)
         self.assertIsNotNone(final.items[1].delivery)
+
+
+class DynamicHedgeBudgetTests(unittest.TestCase):
+    def test_deadline_first_rescues_nearest_deadline_item(self):
+        model = GateModel(version="dyn-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 1.0, 1.0), (3,)),
+                    Request((2.0, 2.0, 2.0), (3,)),
+                    Request((3.0, 3.0, 3.0), (3,)),
+                ],
+                hedge=HedgeConfig(
+                    budget=2,
+                    delay=5.0,
+                    strategy=HedgeStrategy.DEADLINE_FIRST,
+                    item_specs=(
+                        HedgeItemSpec(),
+                        HedgeItemSpec(deadline=0.2),
+                        HedgeItemSpec(deadline=0.5),
+                    ),
+                ),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.report()
+            hedge_counts = [
+                len([c for c in item.candidates if c.role.startswith("hedge")])
+                for item in report.items
+            ]
+            # The whole budget rescues the item closest to its deadline.
+            self.assertEqual(hedge_counts, [0, 2, 0])
+            self.assertEqual(report.hedge_strategy, HedgeStrategy.DEADLINE_FIRST)
+            self.assertEqual(report.hedge_budget.pending, 2)
+            self.assertEqual(report.hedge_budget.remaining, 0)
+            self.assertEqual(
+                [item.hedge_deadline for item in report.items],
+                [None, 0.2, 0.5],
+            )
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        # Primaries delivered; the never-started hedges returned their slots.
+        self.assertEqual(final.hedge_budget.pending, 0)
+        self.assertEqual(final.hedge_budget.completed, 0)
+        self.assertEqual(final.hedge_budget.remaining, 2)
+
+    def test_deadline_first_respects_per_item_caps_and_priority_ties(self):
+        model = GateModel(version="dyn-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 1.0, 1.0), (3,)),
+                    Request((2.0, 2.0, 2.0), (3,), priority=Priority.HIGH),
+                    Request((3.0, 3.0, 3.0), (3,)),
+                ],
+                hedge=HedgeConfig(
+                    budget=2,
+                    delay=5.0,
+                    strategy=HedgeStrategy.DEADLINE_FIRST,
+                    item_specs=(
+                        HedgeItemSpec(),
+                        HedgeItemSpec(deadline=0.2, hedge_cap=1),
+                        HedgeItemSpec(deadline=0.5),
+                    ),
+                ),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.report()
+            hedge_counts = [
+                len([c for c in item.candidates if c.role.startswith("hedge")])
+                for item in report.items
+            ]
+            # Item 2 is capped at one slot; the second slot rescues item 3.
+            self.assertEqual(hedge_counts, [0, 1, 1])
+            self.assertEqual(report.items[1].hedge_cap, 1)
+            model.release.set()
+            group.wait(2)
+
+    def test_fair_strategy_spreads_budget_round_robin(self):
+        model = GateModel(version="dyn-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 1.0, 1.0), (3,)),
+                    Request((2.0, 2.0, 2.0), (3,)),
+                ],
+                hedge=HedgeConfig(budget=2, delay=5.0, strategy=HedgeStrategy.FAIR),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.report()
+            hedge_counts = [
+                len([c for c in item.candidates if c.role.startswith("hedge")])
+                for item in report.items
+            ]
+            self.assertEqual(hedge_counts, [1, 1])
+            self.assertEqual(report.hedge_strategy, HedgeStrategy.FAIR)
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+
+    def test_freed_slot_migrates_to_still_waiting_item(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 1.0, 1.0), (3,)),
+                    Request((2.0, 2.0, 2.0), (3,)),
+                ],
+                hedge=HedgeConfig(budget=1, delay=5.0),
+            )
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        roles = [[c.role for c in item.candidates] for item in final.items]
+        # The single slot started on item 1, then migrated to item 2 once
+        # item 1 was delivered; it was never promised to both at once.
+        self.assertEqual(roles, [["primary", "hedge-1"], ["primary", "hedge-1"]])
+        for item in final.items:
+            self.assertEqual(item.state, ItemState.EXECUTED)
+            self.assertIsNotNone(item.delivery)
+            self.assertEqual(
+                [c.state for c in item.candidates],
+                [CandidateState.FINISHED, CandidateState.CANCELLED],
+            )
+        self.assertEqual(final.hedge_budget.used, 0)
+        self.assertEqual(final.hedge_budget.remaining, 1)
+        # Real work: exactly the two primary executions ran.
+        self.assertEqual(model.calls, 2)
+
+    def test_interleaved_commit_and_cancel_never_double_promises_slot(self):
+        model = GateModel(version="dyn-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=1, delay=0.02),
+            )
+            self.assertTrue(model.entered.wait(1))
+            time.sleep(0.1)  # hedge timer fired; the slot is now committed
+            mid = group.report()
+            self.assertEqual(mid.hedge_budget.committed, 1)
+            self.assertEqual(mid.hedge_budget.remaining, 0)
+            report = group.cancel_remaining()
+            model.release.set()
+            time.sleep(0.05)
+            settled = group.report()
+        self.assertEqual(report.state, GroupState.CANCELLED)
+        item = settled.items[0]
+        self.assertIsNone(item.delivery)
+        # No duplicate candidate was created for the same slot.
+        self.assertEqual([c.role for c in item.candidates], ["primary", "hedge-1"])
+        hedge = item.candidates[1]
+        self.assertEqual(hedge.state, CandidateState.CANCELLED)
+        # The commitment was real and cancellation cannot erase it.
+        self.assertTrue(hedge.committed)
+        self.assertEqual(settled.hedge_budget.committed, 1)
+        self.assertEqual(settled.hedge_budget.remaining, 0)
+
+    def test_consistent_contract_needs_two_checks_despite_fast_result(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=0, delivery=HedgeDelivery.CONSISTENT),
+            )
+            report = group.wait(2)
+        # Budget too small for a second check: the single fast primary
+        # result cannot impersonate a completed double-checked delivery.
+        self.assertEqual(report.state, GroupState.FAILED)
+        item = report.items[0]
+        self.assertIsNone(item.delivery)
+        self.assertEqual(item.unmet_reason, "insufficient_conforming_results")
+        self.assertEqual([c.role for c in item.candidates], ["primary"])
+        self.assertEqual(report.hedge_budget.total, 0)
+        self.assertEqual(report.hedge_budget.used, 0)
+
+    def test_fast_and_slow_candidates_deliver_once_and_count_real_work(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=1, delay=0.01),
+            )
+            report = group.wait(2)
+            time.sleep(0.15)  # let the slower hedge finish as well
+            settled = group.report()
+        self.assertEqual(report.state, GroupState.EXECUTED)
+        item = settled.items[0]
+        self.assertEqual(item.state, ItemState.EXECUTED)
+        # The fast primary won; the slower hedge never became a second item.
+        self.assertEqual(item.delivery.candidate_id, item.candidates[0].candidate_id)
+        self.assertEqual(
+            [c.state for c in item.candidates],
+            [CandidateState.FINISHED, CandidateState.FINISHED],
+        )
+        self.assertEqual(len(settled.items), 1)
+        self.assertEqual(settled.hedge_budget.completed, 1)
+        self.assertEqual(settled.hedge_budget.remaining, 0)
+        # Both executions really happened and stay on the record.
+        self.assertEqual(model.calls, 2)
+
+    def test_model_withdrawal_blocks_pinned_candidates_and_keeps_records(self):
+        model = CountingSlowModel(version="v1")
+        replacement = CountingSlowModel(version="v2")
+        config = ExecutorConfig(
+            max_batch_size=2,
+            max_wait_time=0.3,
+            default_timeout=0.15,
+        )
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=1, delay=0.01),
+                timeout=0.15,
+            )
+            executor.reload_model(replacement)
+            report = group.wait(3)
+        # The pinned group could not run on the withdrawn version; nothing
+        # was delivered and no ineligible version claimed a delivery slot.
+        self.assertEqual(report.state, GroupState.FAILED)
+        item = report.items[0]
+        self.assertIsNone(item.delivery)
+        self.assertEqual(item.unmet_reason, "insufficient_conforming_results")
+        self.assertEqual(item.state, ItemState.FAILED)
+        self.assertEqual(
+            [c.state for c in item.candidates],
+            [CandidateState.FAILED, CandidateState.FAILED],
+        )
+        self.assertTrue(all(c.batch_id is None for c in item.candidates))
+        # The committed hedge's failure stays on the work record.
+        self.assertEqual(report.hedge_budget.completed, 1)
+        self.assertEqual(report.hedge_budget.remaining, 0)
+        self.assertEqual(model.calls, 0)
+        self.assertEqual(replacement.calls, 0)
+
+    def test_snapshot_preserves_strategy_and_item_specs(self):
+        model = CountingSlowModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dynamic.json"
+            with DynamicBatchingExecutor(model, config) as executor:
+                group = executor.submit_group(
+                    [Request((1.0, 2.0, 3.0), (3,))],
+                    hedge=HedgeConfig(
+                        budget=1,
+                        delay=0.01,
+                        strategy=HedgeStrategy.DEADLINE_FIRST,
+                        item_specs=(HedgeItemSpec(deadline=0.5, hedge_cap=1),),
+                    ),
+                )
+                group.wait(2)
+                group.save(path)
+            reopened = GroupStore().load(path).report()
+            self.assertEqual(reopened.hedge_strategy, HedgeStrategy.DEADLINE_FIRST)
+            self.assertEqual(reopened.items[0].hedge_deadline, 0.5)
+            self.assertEqual(reopened.items[0].hedge_cap, 1)
+            self.assertEqual(reopened.state, GroupState.EXECUTED)
+            repeated = GroupStore().load(path).report()
+            self.assertEqual(reopened, repeated)
 
 
 if __name__ == "__main__":

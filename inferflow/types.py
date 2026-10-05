@@ -38,6 +38,18 @@ class HedgeDelivery(Enum):
     CONSISTENT = "consistent"
 
 
+class HedgeStrategy(Enum):
+    """How the group-wide redundant-execution budget is distributed.
+
+    FAIR spreads slots round-robin so every waiting item is helped
+    equally; DEADLINE_FIRST rescues the item closest to its delivery
+    deadline first (ties broken by request priority, then arrival order).
+    """
+
+    FAIR = "fair"
+    DEADLINE_FIRST = "deadline_first"
+
+
 class CandidateState(Enum):
     """Lifecycle of one redundant execution within a request item."""
 

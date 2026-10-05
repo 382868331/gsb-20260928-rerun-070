@@ -139,7 +139,37 @@ returns first, and two candidates never count as two completed items.
   reopened hedged group returns the same decision on repeated queries.
   `retry_unfinished()` re-runs only items without a delivery under the same
   contract and never resubmits confirmed items. Groups created without a
-  `HedgeConfig` keep the previous single-execution behavior unchanged.
+   `HedgeConfig` keep the previous single-execution behavior unchanged.
+
+## Dynamic hedge budget allocation
+
+The group-wide hedge budget is allocated on demand instead of upfront. The
+allocator runs whenever deliveries, completions, or withdrawals change the
+accounting, and each free slot is promised to exactly one item at a time
+under the group lock:
+
+- `HedgeConfig.strategy` selects the distribution policy. `HedgeStrategy.FAIR`
+  (default) rotates slots round-robin so every waiting item is helped
+  equally; `HedgeStrategy.DEADLINE_FIRST` concentrates slots on the item
+  closest to its delivery deadline, breaking ties by request priority and
+  arrival order.
+- `HedgeConfig.item_specs` accepts one `HedgeItemSpec` per request item,
+  carrying a `deadline` (seconds from group submission) and a `hedge_cap`
+  bounding how many extra executions that item may draw from the shared
+  budget (overriding `max_hedges_per_item`).
+- A slot backing a candidate that was withdrawn before it ever started is
+  returned and can be re-promised to another still-waiting item; a slot
+  backing committed or completed work is never reused, and executed work is
+  never erased by later failure or cancellation. `HedgeBudgetReport.used`
+  therefore never exceeds `total`.
+- Each `ItemReport` echoes its `hedge_deadline` and effective `hedge_cap`,
+  and `GroupReport.hedge_strategy` records the policy in effect; both are
+  preserved across `save()`/`GroupStore.load()` snapshots.
+- Undeliverable items keep an explicit `unmet_reason`
+  (`insufficient_conforming_results`, `model_version_ineligible`,
+  `redundant_results_mismatch`, or `all_candidates_cancelled`) regardless
+  of the delivery mode, so a group can never report success while hiding an
+  unexplained shortfall.
 
 ## Tests
 
