@@ -138,6 +138,8 @@ class DynamicBatchingExecutor:
                     priority=request.priority,
                     required_model_version=required_version,
                     request_id=request.request_id,
+                    deadline=request.deadline,
+                    max_redundancy=request.max_redundancy,
                 )
             )
         return RequestGroup(

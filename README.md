@@ -141,6 +141,29 @@ returns first, and two candidates never count as two completed items.
   contract and never resubmits confirmed items. Groups created without a
   `HedgeConfig` keep the previous single-execution behavior unchanged.
 
+## Dynamic budget allocation
+
+Callers attach a delivery `deadline` (seconds after group submission) and a
+`max_redundancy` cap to each `Request`, alongside its existing `priority`.
+`HedgeConfig.strategy` selects how the group-wide budget is spent:
+
+- `AllocationStrategy.FAIR` (default) always serves the eligible item with
+  the fewest hedges, spreading the budget evenly in arrival order.
+- `AllocationStrategy.DEADLINE_FIRST` rescues the undelivered item closest
+  to its deadline first; items without a deadline are served last.
+
+The budget is a dynamic pool rather than a static plan. A slot is promised
+to exactly one pending candidate at a time; when that candidate is
+withdrawn before starting (delivery fixed, deadline passed, or cancelled),
+the slot returns to the pool and is immediately re-promised to the next
+eligible item under the active strategy. Interleaved starts and cancels
+can therefore never promise one slot to two items. A candidate that
+entered a batch is irrevocable: `HedgeBudgetReport.executed` counts that
+real work and it survives failure, cancellation, a fixed delivery, and
+snapshot round trips. An item whose deadline passes undelivered stops
+receiving new slots and reports `deadline_exceeded` until a late
+conforming candidate still delivers it.
+
 ## Tests
 
 ```bash

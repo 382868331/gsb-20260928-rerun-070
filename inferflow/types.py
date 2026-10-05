@@ -38,6 +38,13 @@ class HedgeDelivery(Enum):
     CONSISTENT = "consistent"
 
 
+class AllocationStrategy(Enum):
+    """How the group spends its dynamic redundant-execution budget."""
+
+    FAIR = "fair"
+    DEADLINE_FIRST = "deadline_first"
+
+
 class CandidateState(Enum):
     """Lifecycle of one redundant execution within a request item."""
 
@@ -91,6 +98,11 @@ class Request:
     dtype: type = float
     priority: Priority = Priority.NORMAL
     required_model_version: Optional[str] = None
+    # Seconds after group submission by which the caller needs delivery;
+    # used only by hedged groups to steer budget allocation.
+    deadline: Optional[float] = None
+    # Maximum number of redundant executions this item may receive.
+    max_redundancy: Optional[int] = None
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property

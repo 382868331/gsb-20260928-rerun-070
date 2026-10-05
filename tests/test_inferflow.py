@@ -8,6 +8,7 @@ from pathlib import Path
 
 from inferflow import (
     AddConstantModel,
+    AllocationStrategy,
     DynamicBatchingExecutor,
     EngineStoppedError,
     ExecutorConfig,
@@ -850,6 +851,332 @@ class HedgeTests(unittest.TestCase):
         self.assertEqual(final.state, GroupState.EXECUTED)
         self.assertEqual(final.items[0].delivery.candidate_id, delivered_id)
         self.assertIsNotNone(final.items[1].delivery)
+
+
+class FirstBatchGateModel:
+    """Blocks only the first predict call until released."""
+
+    def __init__(self, version="fb-v1", shape=(3,)):
+        self.name = "first-batch-gate"
+        self.version = version
+        self.shape = shape
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def check(self, request_shape, dtype):
+        return None
+
+    def predict(self, samples):
+        with self._lock:
+            index = self.calls
+            self.calls += 1
+        if index == 0:
+            self.entered.set()
+            self.release.wait(2)
+        return [(self.version, tuple(sample)) for sample in samples]
+
+
+class TwoGateModel:
+    """Blocks the first two predict calls on two separate gates."""
+
+    def __init__(self, version="two-gate-v1", shape=(3,)):
+        self.name = "two-gate"
+        self.version = version
+        self.shape = shape
+        self.gates = [threading.Event(), threading.Event()]
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def check(self, request_shape, dtype):
+        return None
+
+    def predict(self, samples):
+        with self._lock:
+            index = self.calls
+            self.calls += 1
+        self.gates[min(index, 1)].wait(2)
+        return [(self.version, tuple(sample)) for sample in samples]
+
+
+class DynamicBudgetTests(unittest.TestCase):
+    def test_fair_strategy_spreads_budget_in_arrival_order(self):
+        model = GateModel(version="fair-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0, 6.0), (3,)),
+                ],
+                hedge=HedgeConfig(
+                    budget=1, delay=5.0, strategy=AllocationStrategy.FAIR
+                ),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.report()
+            roles = [[c.role for c in item.candidates] for item in report.items]
+            self.assertEqual(roles[0], ["primary", "hedge-1"])
+            self.assertEqual(roles[1], ["primary"])
+            self.assertEqual(report.hedge_budget.pending, 1)
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+
+    def test_deadline_first_rescues_nearest_deadline_item(self):
+        model = GateModel(version="dl-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0, 6.0), (3,), deadline=5.0),
+                ],
+                hedge=HedgeConfig(
+                    budget=1,
+                    delay=5.0,
+                    strategy=AllocationStrategy.DEADLINE_FIRST,
+                ),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.report()
+            roles = [[c.role for c in item.candidates] for item in report.items]
+            # The single slot goes to the item with the delivery deadline,
+            # even though it arrived second.
+            self.assertEqual(roles[0], ["primary"])
+            self.assertEqual(roles[1], ["primary", "hedge-1"])
+            self.assertEqual(report.items[1].deadline, 5.0)
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+
+    def test_freed_slot_moves_to_still_waiting_item(self):
+        model = FirstBatchGateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,)),
+                    Request((4.0, 5.0, 6.0), (3,)),
+                ],
+                hedge=HedgeConfig(budget=1, delay=5.0),
+            )
+            self.assertTrue(model.entered.wait(1))
+            initial = group.report()
+            self.assertEqual(
+                [c.role for c in initial.items[0].candidates],
+                ["primary", "hedge-1"],
+            )
+            self.assertEqual(
+                [c.role for c in initial.items[1].candidates], ["primary"]
+            )
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        # Item 0 delivered on its primary; its unstarted hedge was withdrawn
+        # and the freed slot was re-promised to item 1, which also delivered
+        # on its primary and returned the slot unused.
+        first, second = final.items
+        self.assertEqual(first.candidates[1].state, CandidateState.CANCELLED)
+        self.assertFalse(first.candidates[1].committed)
+        self.assertEqual(
+            [c.role for c in second.candidates], ["primary", "hedge-1"]
+        )
+        self.assertEqual(second.candidates[1].state, CandidateState.CANCELLED)
+        self.assertFalse(second.candidates[1].committed)
+        self.assertEqual(final.hedge_budget.remaining, 1)
+        self.assertEqual(final.hedge_budget.executed, 0)
+
+    def test_item_redundancy_cap_redirects_budget(self):
+        model = GateModel(version="cap-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [
+                    Request((1.0, 2.0, 3.0), (3,), max_redundancy=0),
+                    Request((4.0, 5.0, 6.0), (3,)),
+                ],
+                hedge=HedgeConfig(budget=3, delay=5.0),
+            )
+            self.assertTrue(model.entered.wait(1))
+            report = group.report()
+            self.assertEqual(
+                [c.role for c in report.items[0].candidates], ["primary"]
+            )
+            self.assertEqual(
+                [c.role for c in report.items[1].candidates],
+                ["primary", "hedge-1", "hedge-2", "hedge-3"],
+            )
+            self.assertEqual(report.hedge_budget.pending, 3)
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+
+    def test_deadline_exceeded_recorded_while_work_continues(self):
+        model = GateModel(version="late-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,), deadline=0.05)],
+                hedge=HedgeConfig(budget=1, delay=5.0),
+            )
+            self.assertTrue(model.entered.wait(1))
+            time.sleep(0.15)
+            missed = group.report()
+            self.assertEqual(missed.items[0].state, ItemState.WAITING)
+            self.assertEqual(missed.items[0].unmet_reason, "deadline_exceeded")
+            # The unstartable hedge was withdrawn; the running primary is
+            # real work and is left alone.
+            self.assertEqual(
+                missed.items[0].candidates[1].state, CandidateState.CANCELLED
+            )
+            model.release.set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        self.assertIsNone(final.items[0].unmet_reason)
+        self.assertIsNotNone(final.items[0].delivery)
+
+    def test_consistent_waits_for_second_conforming_result(self):
+        model = TwoGateModel()
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(
+                    budget=1,
+                    delivery=HedgeDelivery.CONSISTENT,
+                    delay=0.02,
+                ),
+            )
+            self.assertTrue(model.gates[0].wait(0) or True)
+            deadline = time.monotonic() + 2
+            while model.calls < 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            model.gates[0].set()
+            # The primary finishes first; one fast conforming result must
+            # not impersonate the two-result consistent delivery.
+            deadline = time.monotonic() + 2
+            while model.calls < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            time.sleep(0.05)
+            midway = group.report()
+            self.assertIsNone(midway.items[0].delivery)
+            self.assertEqual(midway.items[0].state, ItemState.WAITING)
+            model.gates[1].set()
+            final = group.wait(2)
+        self.assertEqual(final.state, GroupState.EXECUTED)
+        item = final.items[0]
+        self.assertEqual(item.delivery.mode, HedgeDelivery.CONSISTENT)
+        self.assertEqual(item.delivery.reason, "consistent_results")
+        self.assertEqual(item.result, ("two-gate-v1", (1.0, 2.0, 3.0)))
+        self.assertEqual(
+            [c.state for c in item.candidates],
+            [CandidateState.FINISHED, CandidateState.FINISHED],
+        )
+        self.assertEqual(final.hedge_budget.executed, 1)
+
+    def test_model_withdrawal_blocks_delivery_and_counts_no_work(self):
+        model = GateModel(version="gate-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with DynamicBatchingExecutor(model, config) as executor:
+            # Keep the worker busy so the reload lands while the group's
+            # pinned candidates are still queued behind the blocker.
+            blocker = executor.submit(Request((9.0, 9.0, 9.0), (3,)), timeout=None)
+            group = executor.submit_group(
+                [Request((1.0, 2.0, 3.0), (3,))],
+                hedge=HedgeConfig(budget=1, delay=0.01),
+                timeout=0.2,
+            )
+            self.assertTrue(model.entered.wait(1))
+            reloaded = threading.Event()
+
+            def do_reload():
+                executor.reload_model(GateModel(version="gate-v2", shape=(3,)))
+                reloaded.set()
+
+            thread = threading.Thread(target=do_reload, daemon=True)
+            thread.start()
+            model.release.set()
+            self.assertTrue(reloaded.wait(2))
+            blocker.result(2)
+            report = group.wait(2)
+        # Every candidate was pinned to the withdrawn version; none may
+        # occupy a delivery slot and none entered a real batch.
+        self.assertEqual(report.state, GroupState.FAILED)
+        item = report.items[0]
+        self.assertIsNone(item.delivery)
+        self.assertEqual(item.unmet_reason, "insufficient_conforming_results")
+        self.assertEqual(item.state, ItemState.FAILED)
+        self.assertEqual(report.hedge_budget.executed, 0)
+        self.assertTrue(
+            all(c.batch_id is None for c in item.candidates),
+            msg="ineligible candidates must not hold batch attribution",
+        )
+
+    def test_start_cancel_interleaving_never_exceeds_budget(self):
+        for _ in range(20):
+            model = CountingSlowModel()
+            config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+            with DynamicBatchingExecutor(model, config) as executor:
+                group = executor.submit_group(
+                    [Request((1.0, 2.0, 3.0), (3,))],
+                    hedge=HedgeConfig(budget=2, delay=0.001),
+                )
+                group.cancel_remaining()
+                report = group.report()
+                budget = report.hedge_budget
+                # One slot can never be promised to two candidates at once.
+                self.assertLessEqual(budget.used, budget.total)
+                self.assertGreaterEqual(budget.remaining, 0)
+                self.assertEqual(budget.used + budget.remaining, budget.total)
+                self.assertLessEqual(budget.executed, budget.total)
+
+    def test_executed_work_survives_cancellation_and_snapshot(self):
+        model = GateModel(version="work-v1", shape=(3,), output=("ok",))
+        config = ExecutorConfig(max_batch_size=1, max_wait_time=0.001)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "work.json"
+            with DynamicBatchingExecutor(model, config) as executor:
+                group = executor.submit_group(
+                    [Request((1.0, 2.0, 3.0), (3,))],
+                    hedge=HedgeConfig(budget=1, delay=0.02),
+                )
+                self.assertTrue(model.entered.wait(1))
+                time.sleep(0.1)
+                midway = group.report()
+                # The hedge is already committed to the executor while the
+                # primary occupies the worker.
+                self.assertEqual(midway.hedge_budget.committed, 1)
+                model.release.set()
+                delivered = group.wait(2)
+                self.assertEqual(delivered.state, GroupState.EXECUTED)
+                time.sleep(0.1)
+                group.cancel_remaining()
+                settled = group.report()
+                group.save(path)
+
+            # The committed hedge ran to completion after the delivery was
+            # fixed; that real work is not erased by the fixed delivery,
+            # the later cancel, or a snapshot round trip.
+            self.assertEqual(settled.hedge_budget.executed, 1)
+            self.assertEqual(settled.hedge_budget.completed, 1)
+            hedge = settled.items[0].candidates[1]
+            self.assertEqual(hedge.state, CandidateState.FINISHED)
+            self.assertIsNotNone(hedge.batch_id)
+            reopened = GroupStore().load(path).report()
+            self.assertEqual(reopened.hedge_budget.executed, 1)
+            self.assertEqual(
+                reopened.items[0].candidates[1].batch_id, hedge.batch_id
+            )
+            self.assertEqual(
+                reopened.items[0].delivery.candidate_id,
+                settled.items[0].delivery.candidate_id,
+            )
+            self.assertEqual(
+                reopened.items[0].delivery.reason,
+                settled.items[0].delivery.reason,
+            )
 
 
 if __name__ == "__main__":

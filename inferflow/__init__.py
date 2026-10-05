@@ -30,6 +30,7 @@ from .groups import (
 )
 from .models import AddConstantModel, LinearModel, Model
 from .types import (
+    AllocationStrategy,
     BatchAttribution,
     CandidateState,
     GroupState,
@@ -44,6 +45,7 @@ from .types import (
 
 __all__ = [
     "AddConstantModel",
+    "AllocationStrategy",
     "BatchAttribution",
     "CandidateReport",
     "CandidateState",

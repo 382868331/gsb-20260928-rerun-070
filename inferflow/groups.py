@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from .errors import EngineStoppedError, RequestCancelledError, VersionContractError
 from .types import (
+    AllocationStrategy,
     BatchAttribution,
     CandidateState,
     GroupState,
@@ -32,12 +33,20 @@ class HedgeConfig:
     attempt for the whole group. ``delivery`` selects the delivery contract:
     the first conforming candidate, or two conforming candidates checked for
     equal content.
+
+    ``strategy`` decides which undelivered item receives the next budget
+    slot: ``FAIR`` spreads slots round-robin, ``DEADLINE_FIRST`` rescues the
+    item whose caller-supplied deadline is closest. Slots are allocated
+    dynamically: a slot held by a candidate that never started returns to
+    the pool and can be promised to another item, while a committed or
+    completed execution keeps its slot forever.
     """
 
     budget: int = 1
     delivery: HedgeDelivery = HedgeDelivery.FIRST_CONFORMING
     delay: Optional[float] = None
     max_hedges_per_item: Optional[int] = None
+    strategy: AllocationStrategy = AllocationStrategy.FAIR
 
 
 @dataclass(frozen=True)
@@ -77,6 +86,12 @@ class HedgeBudgetReport:
     pending: int
     committed: int
     completed: int
+    # Hedge candidates that entered a real batch. This work is never
+    # erased by later failure, cancellation, or a fixed delivery.
+    executed: int = 0
+    # Candidates that actually entered a batch; real work is never erased
+    # by later failure or cancellation.
+    executed: int = 0
 
     @property
     def used(self) -> int:
@@ -100,6 +115,9 @@ class ItemReport:
     candidates: tuple[CandidateReport, ...] = ()
     delivery: Optional[DeliveryRecord] = None
     unmet_reason: Optional[str] = None
+    # Caller-supplied delivery deadline in seconds after group submission.
+    deadline: Optional[float] = None
+    deadline: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +165,7 @@ class _GroupItem:
     delivery: Optional[DeliveryRecord] = None
     unmet_reason: Optional[str] = None
     attempts: list = field(default_factory=list)
+    deadline_at: Optional[float] = None
 
     @property
     def candidates(self) -> list[_Candidate]:
@@ -200,6 +219,8 @@ class RequestGroup:
             self.pinned_version = executor.model.version
         self._hedge = hedge
         self._hedge_clock = getattr(executor, "_clock", time.monotonic)
+        self._submitted_at = self._hedge_clock()
+        self._budget_pool = hedge.budget if hedge is not None else 0
         self._items: dict[str, _GroupItem] = {}
         self._saved_reports: dict[str, GroupReport] = {}
         self._submit_timeout = submit_timeout
@@ -218,6 +239,11 @@ class RequestGroup:
                 item_id=submission.request_id,
                 request=submission,
                 primary=primary,
+                deadline_at=(
+                    None
+                    if submission.deadline is None
+                    else self._submitted_at + submission.deadline
+                ),
             )
             self._items[submission.request_id] = item
             self._commit_candidate(item, primary)
@@ -240,6 +266,8 @@ class RequestGroup:
             priority=request.priority,
             required_model_version=required_version,
             request_id=request.request_id,
+            deadline=request.deadline,
+            max_redundancy=request.max_redundancy,
         )
 
     def _new_hedge_request(self, template: Request) -> Request:
@@ -252,42 +280,91 @@ class RequestGroup:
             dtype=template.dtype,
             priority=template.priority,
             required_model_version=required_version,
+            deadline=template.deadline,
+            max_redundancy=template.max_redundancy,
         )
 
     # -- redundant execution -------------------------------------------------
 
     def _schedule_hedges(self) -> None:
+        with self._lock:
+            self._allocate_budget_locked()
+
+    def _item_redundancy_cap(self, item: _GroupItem) -> Optional[int]:
+        caps = []
+        if self._hedge.max_hedges_per_item is not None:
+            caps.append(self._hedge.max_hedges_per_item)
+        if item.request.max_redundancy is not None:
+            caps.append(item.request.max_redundancy)
+        return min(caps) if caps else None
+
+    def _item_deadline_passed(self, item: _GroupItem) -> bool:
+        return item.deadline_at is not None and self._hedge_clock() >= item.deadline_at
+
+    def _item_eligible_for_hedge(self, item: _GroupItem) -> bool:
+        if item.delivery is not None:
+            return False
+        if self._item_deadline_passed(item):
+            return False
+        cap = self._item_redundancy_cap(item)
+        if cap is not None and len(item.hedges) >= cap:
+            return False
+        if all(
+            candidate.state is CandidateState.CANCELLED
+            for candidate in item.candidates
+        ):
+            return False
+        return True
+
+    def _next_allocation_item(self) -> Optional[_GroupItem]:
+        eligible = [
+            item for item in self._items.values() if self._item_eligible_for_hedge(item)
+        ]
+        if not eligible:
+            return None
+        if self._hedge.strategy is AllocationStrategy.DEADLINE_FIRST:
+            # Rescue the item closest to its delivery deadline first; items
+            # without a deadline are served after every deadline-bound item.
+            eligible.sort(
+                key=lambda item: (
+                    item.deadline_at is None,
+                    item.deadline_at if item.deadline_at is not None else 0.0,
+                    len(item.hedges),
+                )
+            )
+        else:
+            # Fair: the item with the fewest hedges so far is served next,
+            # so a group-wide budget is spread evenly across items.
+            eligible.sort(key=lambda item: len(item.hedges))
+        return eligible[0]
+
+    def _allocate_budget_locked(self) -> None:
         hedge = self._hedge
+        if hedge is None or self._executor is None:
+            return
         delay = hedge.delay if hedge.delay is not None else 0.05
-        per_item_cap = hedge.max_hedges_per_item
-        items = list(self._items.values())
-        allocated = 0
-        # Round-robin so a group-wide budget is spread fairly across items.
-        while allocated < hedge.budget:
-            progressed = False
-            for item in items:
-                if allocated >= hedge.budget:
-                    break
-                if per_item_cap is not None and len(item.hedges) >= per_item_cap:
-                    continue
-                index = len(item.hedges)
-                candidate = _Candidate(
-                    candidate_id=uuid.uuid4().hex,
-                    role=f"hedge-{index + 1}",
-                )
-                item.hedges.append(candidate)
-                allocated += 1
-                progressed = True
-                timer = threading.Timer(
-                    delay * (index + 1),
-                    self._start_hedge,
-                    args=(item.item_id, candidate.candidate_id),
-                )
-                timer.daemon = True
-                candidate.timer = timer
-                timer.start()
-            if not progressed:
+        while self._budget_pool > 0:
+            item = self._next_allocation_item()
+            if item is None:
                 break
+            index = len(item.hedges)
+            candidate = _Candidate(
+                candidate_id=uuid.uuid4().hex,
+                role=f"hedge-{index + 1}",
+            )
+            item.hedges.append(candidate)
+            # The slot is promised to exactly this candidate; it returns to
+            # the pool only if the candidate is withdrawn before starting.
+            self._budget_pool -= 1
+            item.unmet_reason = None
+            timer = threading.Timer(
+                delay * (index + 1),
+                self._start_hedge,
+                args=(item.item_id, candidate.candidate_id),
+            )
+            timer.daemon = True
+            candidate.timer = timer
+            timer.start()
 
     def _start_hedge(self, item_id: str, candidate_id: str) -> None:
         with self._lock:
@@ -323,7 +400,12 @@ class RequestGroup:
         if candidate.timer is not None:
             candidate.timer.cancel()
             candidate.timer = None
+        if candidate.state is not CandidateState.PENDING:
+            return
         candidate.state = CandidateState.CANCELLED
+        # A candidate withdrawn before starting never consumed real work;
+        # its budget slot returns to the pool for another item.
+        self._budget_pool += 1
 
     def _commit_candidate(self, item: _GroupItem, candidate: _Candidate) -> None:
         if candidate.timer is not None:
@@ -389,7 +471,15 @@ class RequestGroup:
         # rewritten by execution records arriving afterwards.
         if item.delivery is not None:
             self._withdraw_obsolete_pending(item)
+            self._allocate_budget_locked()
             return
+
+        if self._item_deadline_passed(item):
+            # The delivery deadline is gone: stop promising new budget to
+            # this item, but never erase work already committed or done.
+            self._withdraw_obsolete_pending(item)
+            if item.unmet_reason is None:
+                item.unmet_reason = "deadline_exceeded"
 
         conforming = [
             candidate
@@ -408,6 +498,7 @@ class RequestGroup:
                 )
                 item.unmet_reason = None
                 self._withdraw_obsolete_pending(item)
+                self._allocate_budget_locked()
                 return
         else:
             if len(conforming) >= 2:
@@ -422,29 +513,35 @@ class RequestGroup:
                     )
                     item.unmet_reason = None
                     self._withdraw_obsolete_pending(item)
+                    self._allocate_budget_locked()
                     return
                 if not item.outstanding:
-                    item.unmet_reason = "redundant_results_mismatch"
+                    if item.unmet_reason is None:
+                        item.unmet_reason = "redundant_results_mismatch"
                     self._withdraw_obsolete_pending(item)
+                    self._allocate_budget_locked()
                     return
-            if not item.outstanding:
-                if conforming:
-                    item.unmet_reason = "insufficient_conforming_results"
-                elif any(
-                    candidate.state is CandidateState.FINISHED
-                    and candidate.future is not None
-                    and candidate.future.attribution is not None
-                    and not self._version_matches(candidate.future.attribution.model_version)
-                    for candidate in item.candidates
-                ):
-                    item.unmet_reason = "model_version_ineligible"
-                elif all(
-                    candidate.state is CandidateState.CANCELLED
-                    for candidate in item.candidates
-                ):
-                    item.unmet_reason = "all_candidates_cancelled"
-                else:
-                    item.unmet_reason = "insufficient_conforming_results"
+        if not item.outstanding and item.unmet_reason is None:
+            # No delivery and nothing left to wait for: record why the
+            # item could not be delivered instead of staying silent.
+            if conforming:
+                item.unmet_reason = "insufficient_conforming_results"
+            elif any(
+                candidate.state is CandidateState.FINISHED
+                and candidate.future is not None
+                and candidate.future.attribution is not None
+                and not self._version_matches(candidate.future.attribution.model_version)
+                for candidate in item.candidates
+            ):
+                item.unmet_reason = "model_version_ineligible"
+            elif all(
+                candidate.state is CandidateState.CANCELLED
+                for candidate in item.candidates
+            ):
+                item.unmet_reason = "all_candidates_cancelled"
+            else:
+                item.unmet_reason = "insufficient_conforming_results"
+        self._allocate_budget_locked()
 
     def _version_matches(self, version: str) -> bool:
         return (
@@ -476,6 +573,8 @@ class RequestGroup:
         group._items = {}
         group._saved_reports = {"reopened": report}
         group._submit_timeout = None
+        group._budget_pool = 0
+        group._submitted_at = group._hedge_clock()
         return group
 
     def refresh(self) -> GroupReport:
@@ -572,6 +671,8 @@ class RequestGroup:
                     shape=request.shape,
                     dtype=request.dtype,
                     priority=request.priority,
+                    deadline=item.request.deadline,
+                    max_redundancy=item.request.max_redundancy,
                 )
             item.request = request
             candidate = _Candidate(
@@ -670,6 +771,7 @@ class RequestGroup:
             candidates=candidates,
             delivery=item.delivery,
             unmet_reason=None if delivered else item.unmet_reason,
+            deadline=item.request.deadline,
         )
 
     def _candidate_report(self, candidate: _Candidate) -> CandidateReport:
@@ -731,19 +833,27 @@ class RequestGroup:
         pending = 0
         committed = 0
         completed = 0
+        executed = 0
         for item in self._items.values():
             for hedge in item.hedges:
                 if hedge.state is CandidateState.PENDING:
                     pending += 1
                 elif hedge.completed_work:
                     completed += 1
-                else:
+                elif hedge.committed:
                     committed += 1
+                # A candidate withdrawn before commit returned its slot to
+                # the pool and accounts for no budget here.
+                if hedge.future is not None and hedge.future.attribution is not None:
+                    # The candidate entered a real batch; that work stands
+                    # even if the candidate later fails or is cancelled.
+                    executed += 1
         return HedgeBudgetReport(
             total=self._hedge.budget,
             pending=pending,
             committed=committed,
             completed=completed,
+            executed=executed,
         )
 
     def _build_report(self, reports: tuple[ItemReport, ...]) -> GroupReport:
@@ -843,6 +953,7 @@ def _report_to_jsonable(report: GroupReport) -> dict[str, Any]:
             "error_type": item.error_type,
             "attribution": _attribution_to_jsonable(item.attribution),
             "attempts": [_attribution_to_jsonable(value) for value in item.attempts],
+            "deadline": item.deadline,
         }
         if report.hedge_delivery is not None:
             entry["unmet_reason"] = item.unmet_reason
@@ -951,6 +1062,7 @@ def _report_from_jsonable(payload: dict[str, Any]) -> GroupReport:
                 candidates=candidates,
                 delivery=delivery,
                 unmet_reason=item.get("unmet_reason"),
+                deadline=item.get("deadline"),
             )
         )
     hedge_budget = None
